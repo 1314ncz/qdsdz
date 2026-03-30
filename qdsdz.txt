@@ -1,0 +1,2823 @@
+-- Roblox qdsdz v0.7 修复版（范围机制替换为 GUST 风格）
+-- 范围攻击现在通过修改目标碰撞箱大小实现，不再主动发送攻击事件
+-- 功能：穿墙（永不中断）、伤害免疫、悬浮、旋转、范围（修改碰撞箱）、传送甩飞、无限跳跃、跟随间隔、头顶高度跟随
+--       格挡循环、M1循环、M2循环、自动自杀、手动自杀、跟随时自动发送狩猎消息
+--       免疫指令：.永恒庇护 <编号>，使目标免疫范围伤害（一次性，退出后失效）
+--       指令系统：支持单字母快捷命令，组合开关 .c 和自动自杀 .as
+--       新增：自在极意（上帝视角环绕）、预判功能、自定义UI背景、加载动画
+-- 范围机制：每帧遍历其他玩家，将他们的 HumanoidRootPart 大小设为指定半径（视觉上扩大碰撞箱）
+
+local PASSWORD = "qdsdz"
+local DEFAULT_USER = "qdsdz"
+local bot_active = false
+
+-- 常量
+local MIN_HEIGHT = -500
+local MAX_HEIGHT = 5000
+local GRAVITY = 196.2
+
+-- 角色状态
+local character = {
+    immunity = false,
+    damage_immunity = false,
+    attacking = false,
+    moving = false,
+    floating = false,
+    follow_target = nil,
+    speed = 100,
+    humanoid = nil,
+    rootPart = nil,
+    floatBody = nil,
+    lastHealth = nil,
+    smooth_follow = true,
+    wallHackActive = false,
+    -- 旋转
+    spin_enabled = false,
+    spin_speed = 100,
+    spin_angularVelocity = nil,
+    -- 范围（新）
+    hitbox_enabled = false,
+    hitbox_size = 1200,                -- 默认大小 1200（与 GUST 一致）
+    hitbox_transparency = 0.9,
+    hitbox_teamCheck = false,
+    hitbox_color = BrickColor.new("Really red"),
+    hitbox_colorName = "Really red",
+    hitbox_connection = nil,           -- 渲染连接
+    -- 传送与甩飞
+    selected_target = nil,
+    loop_teleport_to = false,
+    loop_teleport_from = false,
+    loop_suck_all = false,
+    loop_fling = false,
+    aimbot = false,
+    viewing = false,
+    -- 无限跳跃、跟随间隔、头顶高度
+    infinite_jump = false,
+    follow_interval = 0.1,
+    follow_height_offset = 10,
+    -- 格挡和攻击循环
+    block_enabled = false,
+    m1_enabled = false,
+    m2_enabled = false,
+    block_cooldown = 2,
+    -- 自动自杀
+    auto_suicide = false,
+    -- Y锁定
+    y_lock_enabled = false,
+    y_lock_value = 300,
+    -- 狂铠旋转
+    kuangkai_enabled = false,
+    kuangkai_thread = nil,
+    -- 预判功能
+    prediction_enabled = false,
+    target_velocity = Vector3.new(0, 0, 0),
+    target_last_pos = nil,
+    target_last_time = nil,
+}
+
+local damageImmunityList = {}
+local hitboxImmunePlayers = {}
+local followLoop = nil
+local lastPlayerList = {}
+local heartbeatConnection = nil
+local jumpConnection = nil
+local immunityMaintainConnection = nil
+local blockLoop = nil
+local m1Loop = nil
+local m2Loop = nil
+local wallHackConnection = nil
+
+getgenv().OldPos = CFrame.new()
+getgenv().FPDH = workspace.FallenPartsDestroyHeight
+
+-- UI 引用
+local ui = {
+    screenGui = nil,
+    mainFrame = nil,
+    scrollFrame = nil,
+    menuButton = nil,
+    statusText = nil,
+    immunityBtn = nil,
+    floatBtn = nil,
+    tpInput = nil,
+    tpBtn = nil,
+    followBtn = nil,
+    damageOtherBtn = nil,
+    smoothFollowBtn = nil,
+    heightInput = nil,
+    heightSetBtn = nil,
+    heightUpBtn = nil,
+    heightDownBtn = nil,
+    spinBtn = nil,
+    hitboxBtn = nil,
+    teamCheckBtn = nil,
+    targetInput = nil,
+    refreshBtn = nil,
+    teleportToBtn = nil,
+    loopToBtn = nil,
+    teleportFromBtn = nil,
+    suckAllBtn = nil,
+    viewBtn = nil,
+    flingOnceBtn = nil,
+    loopFlingBtn = nil,
+    aimbotBtn = nil,
+    infiniteJumpBtn = nil,
+    intervalInput = nil,
+    setIntervalBtn = nil,
+    blockBtn = nil,
+    m1Btn = nil,
+    m2Btn = nil,
+    blockCdInput = nil,
+    setBlockCdBtn = nil,
+    comboBtn = nil,
+    autoSuicideBtn = nil,
+    manualSuicideBtn = nil,
+    fhInput = nil,
+    setFhBtn = nil,
+    yLockBtn = nil,
+    yLockInput = nil,
+    setYLockBtn = nil,
+    kuangkaiBtn = nil,
+    predictionBtn = nil,
+    loadingScreen = nil,
+    loadingImage = nil,
+    loadingText = nil,
+}
+
+local player = game:GetService("Players").LocalPlayer
+local players = game:GetService("Players")
+local runService = game:GetService("RunService")
+local userInputService = game:GetService("UserInputService")
+local tweenService = game:GetService("TweenService")
+
+-- ========== 工具函数 ==========
+local function getCharacter()
+    return player.Character
+end
+
+local function updateCharacterRefs()
+    local success, err = pcall(function()
+        local char = getCharacter()
+        if char then
+            character.humanoid = char:FindFirstChildOfClass("Humanoid")
+            character.rootPart = char:FindFirstChild("HumanoidRootPart")
+            if character.humanoid and not character.lastHealth then
+                character.lastHealth = character.humanoid.Health
+            end
+        end
+    end)
+    if not success then
+        warn("更新角色引用失败:", err)
+    end
+end
+
+local function output(msg, success)
+    local text = "[系统]: " .. msg .. (success and " ✔" or "")
+    if print then print(text) end
+    local success, err = pcall(function()
+        local char = getCharacter()
+        if char and char:FindFirstChild("Head") then
+            game:GetService("Chat"):Chat(char.Head, text)
+        end
+    end)
+    if not success then
+        warn("发送聊天消息失败:", err)
+    end
+end
+
+local function notify(title, text, duration)
+    game:GetService("StarterGui"):SetCore("SendNotification", {
+        Title = title,
+        Text = text,
+        Duration = duration or 3,
+    })
+end
+
+-- ========== 预判功能 ==========
+local function updateTargetVelocity()
+    if not character.prediction_enabled then return end
+    if not character.follow_target then return end
+    
+    local targetPlayer = players:FindFirstChild(character.follow_target)
+    if not targetPlayer or not targetPlayer.Character then return end
+    
+    local targetRoot = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not targetRoot then return end
+    
+    local currentPos = targetRoot.Position
+    local currentTime = tick()
+    
+    if character.target_last_pos and character.target_last_time then
+        local deltaTime = currentTime - character.target_last_time
+        if deltaTime > 0 and deltaTime < 0.5 then
+            local velocity = (currentPos - character.target_last_pos) / deltaTime
+            if velocity.Magnitude < 500 then
+                character.target_velocity = velocity
+            end
+        end
+    end
+    
+    character.target_last_pos = currentPos
+    character.target_last_time = currentTime
+end
+
+local function getPredictedPosition(predictionTime)
+    if not character.prediction_enabled then
+        return nil
+    end
+    
+    local targetPlayer = players:FindFirstChild(character.follow_target)
+    if not targetPlayer or not targetPlayer.Character then return nil end
+    
+    local targetRoot = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not targetRoot then return nil end
+    
+    local currentPos = targetRoot.Position
+    local velocity = character.target_velocity
+    
+    if velocity.Magnitude < 1 then
+        return currentPos
+    end
+    
+    local predictedPos = currentPos + velocity * predictionTime
+    local maxDistance = 50
+    if (predictedPos - currentPos).Magnitude > maxDistance then
+        predictedPos = currentPos + (velocity.Unit * maxDistance)
+    end
+    
+    return predictedPos
+end
+
+local function togglePrediction(state)
+    if state == nil then
+        character.prediction_enabled = not character.prediction_enabled
+    else
+        character.prediction_enabled = state
+    end
+    
+    if character.prediction_enabled then
+        character.target_velocity = Vector3.new(0, 0, 0)
+        character.target_last_pos = nil
+        character.target_last_time = nil
+        output("预判功能开启 - 将预测目标移动轨迹", true)
+    else
+        output("预判功能关闭", true)
+    end
+    updateUI()
+end
+
+-- ========== 玩家列表 ==========
+local function updatePlayerList()
+    local playersList = players:GetPlayers()
+    lastPlayerList = {}
+    for i, p in ipairs(playersList) do
+        if p ~= player then
+            table.insert(lastPlayerList, p.Name)
+        end
+    end
+    return lastPlayerList
+end
+
+local function getPlayerNameByIndex(index)
+    updatePlayerList()
+    if index < 1 or index > #lastPlayerList then return nil end
+    return lastPlayerList[index]
+end
+
+-- ========== 发送消息 ==========
+local function sendChatMessage(message, channel)
+    channel = channel or "All"
+    local success = false
+
+    local TextChatService = game:GetService("TextChatService")
+    if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+        local textChannel = TextChatService.TextChannels:FindFirstChild("RBXGeneral")
+        if textChannel then
+            pcall(function() textChannel:SendAsync(message) end)
+        end
+    else
+        local sayRequest = game:GetService("ReplicatedStorage"):FindFirstChild("DefaultChatSystemChatEvents")
+        if sayRequest then
+            sayRequest = sayRequest:FindFirstChild("SayMessageRequest")
+            if sayRequest then
+                pcall(function() sayRequest:FireServer(message, channel) end)
+            end
+        end
+    end
+end
+
+-- ========== 无限跳跃 ==========
+local function toggleInfiniteJump()
+    character.infinite_jump = not character.infinite_jump
+    if character.infinite_jump then
+        if jumpConnection then jumpConnection:Disconnect() end
+        jumpConnection = userInputService.JumpRequest:Connect(function()
+            if character.infinite_jump and character.humanoid then
+                character.humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+            end
+        end)
+        output("无限跳跃开启", true)
+    else
+        if jumpConnection then
+            jumpConnection:Disconnect()
+            jumpConnection = nil
+        end
+        output("无限跳跃关闭", true)
+    end
+    updateUI()
+end
+
+-- ========== 穿墙（修复版 - 永久生效）==========
+local function maintainImmunity()
+    if not character.immunity then return end
+    
+    local char = getCharacter()
+    if not char then return end
+    
+    local parts = char:GetDescendants()
+    for _, part in ipairs(parts) do
+        if part:IsA("BasePart") then
+            part.CanCollide = false
+            part.Transparency = 0.5
+        end
+    end
+    
+    local rootPart = char:FindFirstChild("HumanoidRootPart")
+    if rootPart then
+        character.rootPart = rootPart
+        rootPart.CanCollide = false
+        rootPart.Transparency = 0.5
+    end
+end
+
+local function applyImmunityToAllParts()
+    local char = getCharacter()
+    if not char then return end
+    
+    local parts = char:GetDescendants()
+    for _, part in ipairs(parts) do
+        if part:IsA("BasePart") then
+            part.CanCollide = false
+            part.Transparency = 0.5
+        end
+    end
+    
+    local rootPart = char:FindFirstChild("HumanoidRootPart")
+    if rootPart then
+        character.rootPart = rootPart
+        rootPart.CanCollide = false
+        rootPart.Transparency = 0.5
+    end
+end
+
+local function restorePartsCollision()
+    local char = getCharacter()
+    if not char then return end
+    
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.CanCollide = true
+            part.Transparency = 0
+        end
+    end
+    
+    local rootPart = char:FindFirstChild("HumanoidRootPart")
+    if rootPart then
+        character.rootPart = rootPart
+        rootPart.CanCollide = true
+        rootPart.Transparency = 0
+    end
+end
+
+local function onCharacterAddedForImmunity(newChar)
+    if character.immunity then
+        task.wait(0.3)
+        applyImmunityToAllParts()
+        
+        if not immunityMaintainConnection then
+            immunityMaintainConnection = runService.Heartbeat:Connect(maintainImmunity)
+        end
+    end
+end
+
+local function setImmunity(enabled)
+    if enabled then
+        if character.immunity then
+            if immunityMaintainConnection then
+                immunityMaintainConnection:Disconnect()
+                immunityMaintainConnection = nil
+            end
+        end
+        
+        applyImmunityToAllParts()
+        immunityMaintainConnection = runService.Heartbeat:Connect(maintainImmunity)
+        
+        if not character.characterAddedConnection then
+            character.characterAddedConnection = player.CharacterAdded:Connect(onCharacterAddedForImmunity)
+        end
+        
+        character.immunity = true
+        character.wallHackActive = true
+        output("穿墙开启（永久生效，永不打断）", true)
+    else
+        if immunityMaintainConnection then
+            immunityMaintainConnection:Disconnect()
+            immunityMaintainConnection = nil
+        end
+        
+        restorePartsCollision()
+        character.immunity = false
+        character.wallHackActive = false
+        output("穿墙关闭", true)
+    end
+    updateUI()
+end
+
+-- ========== 旋转控制 ==========
+local function toggleSpin(enabled)
+    if enabled == nil then
+        character.spin_enabled = not character.spin_enabled
+    else
+        character.spin_enabled = enabled
+    end
+    local char = getCharacter()
+    if not char then return end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        humanoid.AutoRotate = not character.spin_enabled
+    end
+    if character.spin_enabled then
+        if character.spin_angularVelocity then
+            pcall(function() character.spin_angularVelocity:Destroy() end)
+            character.spin_angularVelocity = nil
+        end
+        local av = Instance.new("AngularVelocity")
+        local att = root:FindFirstChild("RootAttachment") or root:FindFirstChild("RootRigAttachment")
+        if att then
+            av.Attachment0 = att
+        end
+        av.MaxTorque = math.huge
+        av.AngularVelocity = Vector3.new(0, character.spin_speed, 0)
+        av.Parent = root
+        character.spin_angularVelocity = av
+        if enabled == nil then output("旋转开启，速度 "..character.spin_speed, true) end
+    else
+        if character.spin_angularVelocity then
+            pcall(function() character.spin_angularVelocity:Destroy() end)
+            character.spin_angularVelocity = nil
+        end
+        if enabled == nil then output("旋转关闭", true) end
+    end
+    updateUI()
+end
+
+local function setSpinSpeed(speed)
+    local s = tonumber(speed)
+    if not s then
+        output("请输入有效数字", false)
+        return
+    end
+    character.spin_speed = s
+    if character.spin_enabled and character.spin_angularVelocity then
+        character.spin_angularVelocity.AngularVelocity = Vector3.new(0, s, 0)
+    end
+    output("旋转速度设为 " .. s, true)
+    updateUI()
+end
+
+-- ========== 悬浮控制 ==========
+local function setFloating(enabled)
+    updateCharacterRefs()
+    if not character.rootPart then output("无法获取角色位置", false) return end
+    if enabled and not character.floating then
+        if character.floatBody then pcall(function() character.floatBody:Destroy() end); character.floatBody = nil end
+        local body = Instance.new("BodyVelocity")
+        body.MaxForce = Vector3.new(0, math.huge, 0)
+        body.Velocity = Vector3.new(0, 0, 0)
+        body.P = 10000
+        body.Parent = character.rootPart
+        character.floatBody = body
+        character.floating = true
+        output("悬浮开启", true)
+    elseif not enabled and character.floating then
+        if character.floatBody then pcall(function() character.floatBody:Destroy() end); character.floatBody = nil end
+        character.floating = false
+        output("悬浮关闭", true)
+    end
+    updateUI()
+end
+
+-- ========== 伤害免疫（其他玩家） ==========
+local function setDamageImmunityForPlayer(targetName, enable)
+    local targetPlayer = players:FindFirstChild(targetName)
+    if not targetPlayer then output("玩家 "..targetName.." 不在线", false) return end
+    if enable then
+        if damageImmunityList[targetName] then task.cancel(damageImmunityList[targetName]); damageImmunityList[targetName] = nil end
+        local thread = task.spawn(function()
+            while true do
+                if not character or not damageImmunityList[targetName] then break end
+                local p = players:FindFirstChild(targetName)
+                if p and p.Character and p.Character:FindFirstChildOfClass("Humanoid") then
+                    local hum = p.Character:FindFirstChildOfClass("Humanoid")
+                    if hum and hum.Health < hum.MaxHealth then
+                        hum.Health = hum.MaxHealth
+                    end
+                else
+                    output("玩家 "..targetName.." 消失，免疫自动关闭", true)
+                    damageImmunityList[targetName] = nil
+                    break
+                end
+                task.wait(0.1)
+            end
+        end)
+        damageImmunityList[targetName] = thread
+        output("已为 "..targetName.." 开启伤害免疫", true)
+    else
+        if damageImmunityList[targetName] then task.cancel(damageImmunityList[targetName]); damageImmunityList[targetName] = nil end
+        output("已关闭 "..targetName.." 的伤害免疫", true)
+    end
+    updateUI()
+end
+
+-- ========== 重置角色 ==========
+local function resetCharacter()
+    updateCharacterRefs()
+    local success, err = pcall(function()
+        if character.rootPart then
+            character.rootPart.CanCollide = true
+            character.rootPart.Transparency = 0
+        end
+        if character.humanoid then character.humanoid.WalkSpeed = 16 end
+        if character.floating then setFloating(false) end
+        if character.follow_target then stopFollow() end
+        if character.immunity then setImmunity(false) end
+        if character.spin_enabled then toggleSpin(false) end
+        if character.hitbox_enabled then toggleHitbox(false) end
+        if character.infinite_jump then toggleInfiniteJump() end
+        if character.block_enabled then toggleBlock(false) end
+        if character.m1_enabled then toggleM1Loop(false) end
+        if character.m2_enabled then toggleM2Loop(false) end
+        if character.prediction_enabled then togglePrediction(false) end
+        character.loop_teleport_to = false
+        character.loop_teleport_from = false
+        character.loop_suck_all = false
+        character.loop_fling = false
+        character.aimbot = false
+        character.viewing = false
+        character.auto_suicide = false
+        character.kuangkai_enabled = false
+        if character.kuangkai_thread then task.cancel(character.kuangkai_thread); character.kuangkai_thread = nil end
+        for name, thread in pairs(damageImmunityList) do
+            task.cancel(thread)
+            damageImmunityList[name] = nil
+        end
+        hitboxImmunePlayers = {}
+        character = {
+            immunity = false,
+            damage_immunity = false,
+            attacking = false,
+            moving = false,
+            floating = false,
+            follow_target = nil,
+            speed = 100,
+            humanoid = character.humanoid,
+            rootPart = character.rootPart,
+            floatBody = nil,
+            lastHealth = character.humanoid and character.humanoid.Health or nil,
+            smooth_follow = true,
+            wallHackActive = false,
+            spin_enabled = false,
+            spin_speed = 100,
+            spin_angularVelocity = nil,
+            hitbox_enabled = false,
+            hitbox_size = 1200,
+            hitbox_transparency = 0.9,
+            hitbox_teamCheck = false,
+            hitbox_color = BrickColor.new("Really red"),
+            hitbox_colorName = "Really red",
+            hitbox_connection = nil,
+            selected_target = nil,
+            loop_teleport_to = false,
+            loop_teleport_from = false,
+            loop_suck_all = false,
+            loop_fling = false,
+            aimbot = false,
+            viewing = false,
+            infinite_jump = false,
+            follow_interval = 0.1,
+            follow_height_offset = 10,
+            block_enabled = false,
+            m1_enabled = false,
+            m2_enabled = false,
+            block_cooldown = 2,
+            auto_suicide = false,
+            y_lock_enabled = false,
+            y_lock_value = 300,
+            kuangkai_enabled = false,
+            kuangkai_thread = nil,
+            prediction_enabled = false,
+            target_velocity = Vector3.new(0,0,0),
+            target_last_pos = nil,
+            target_last_time = nil,
+        }
+    end)
+    if not success then output("重置失败: " .. tostring(err), false) return end
+    output("角色已重置", true)
+    updateUI()
+end
+
+local function adjustSpeed()
+    updateCharacterRefs()
+    if character.humanoid then
+        character.humanoid.WalkSpeed = character.humanoid.WalkSpeed + 5
+        character.speed = character.humanoid.WalkSpeed
+        output("速度+5至 "..character.speed, true)
+        updateUI()
+    else
+        output("无法获取Humanoid", false)
+    end
+end
+
+local function maintainSpeed()
+    if character.humanoid and character.speed then
+        if character.humanoid.WalkSpeed ~= character.speed then
+            character.humanoid.WalkSpeed = character.speed
+        end
+    end
+end
+
+local function setCharacterHeight(y)
+    local height = tonumber(y)
+    if not height then output("请输入有效的数字", false) return end
+    if height < MIN_HEIGHT or height > MAX_HEIGHT then output("高度超出限制 ("..MIN_HEIGHT.."~"..MAX_HEIGHT..")", false) return end
+    updateCharacterRefs()
+    if character.rootPart then
+        local pos = character.rootPart.Position
+        character.rootPart.CFrame = CFrame.new(pos.X, height, pos.Z)
+        if not character.floating then setFloating(true) end
+        output("高度设为 "..height, true)
+        updateUI()
+        if ui.heightInput and ui.heightInput.Parent then ui.heightInput.Text = "" end
+    else
+        output("无法获取角色位置", false)
+    end
+end
+
+-- ========== 获取玩家 ==========
+local function getNearestPlayerName()
+    updateCharacterRefs()
+    if not character.rootPart then return nil end
+    local nearest, minDist = nil, math.huge
+    for _, p in ipairs(players:GetPlayers()) do
+        if p ~= player and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+            local dist = (p.Character.HumanoidRootPart.Position - character.rootPart.Position).Magnitude
+            if dist < minDist then minDist = dist; nearest = p.Name end
+        end
+    end
+    return nearest
+end
+
+local function smoothMoveTo(targetPosition)
+    if not character or not character.rootPart then return end
+    local currentPos = character.rootPart.Position
+    local distance = (targetPosition - currentPos).Magnitude
+    if distance < 3 then
+        character.rootPart.CFrame = CFrame.new(targetPosition)
+        character.rootPart.Velocity = Vector3.new(0,0,0)
+        return
+    end
+    local direction = (targetPosition - currentPos).Unit
+    local moveSpeed = math.min(character.speed, distance * 2)
+    character.rootPart.Velocity = direction * moveSpeed
+    if math.abs(targetPosition.Y - currentPos.Y) > 0.5 then
+        setFloating(true)
+    end
+end
+
+local function smoothMoveHorizontal(targetPosition)
+    if not character or not character.rootPart then return end
+    local currentPos = character.rootPart.Position
+    local targetXZ = Vector3.new(targetPosition.X, currentPos.Y, targetPosition.Z)
+    local distance = (targetXZ - currentPos).Magnitude
+    if distance < 3 then
+        character.rootPart.CFrame = CFrame.new(targetXZ)
+        character.rootPart.Velocity = Vector3.new(0,0,0)
+        return
+    end
+    local direction = (targetXZ - currentPos).Unit
+    local moveSpeed = math.min(character.speed, distance * 2)
+    character.rootPart.Velocity = direction * moveSpeed
+end
+
+local function teleportToPlayer(targetName, smooth)
+    local targetPlayer = players:FindFirstChild(targetName)
+    if not targetPlayer or not targetPlayer.Character or not targetPlayer.Character:FindFirstChild("HumanoidRootPart") then
+        output("玩家 "..targetName.." 不在线或无角色", false)
+        return
+    end
+    updateCharacterRefs()
+    if not character.rootPart then
+        output("无法获取自己的角色位置", false)
+        return
+    end
+    local targetPart = targetPlayer.Character.HumanoidRootPart
+    local targetPos = targetPart.Position
+    local dest = Vector3.new(targetPos.X, targetPos.Y, targetPos.Z)
+    if smooth then
+        smoothMoveTo(dest)
+        output("正在平滑移动到 "..targetPlayer.Name, true)
+    else
+        character.rootPart.CFrame = CFrame.new(dest)
+        character.rootPart.Velocity = Vector3.new(0,0,0)
+        if not character.floating then setFloating(true) end
+        output("已传送到 "..targetPlayer.Name.." 的位置", true)
+    end
+    if ui.tpInput and ui.tpInput.Parent then
+        ui.tpInput.Text = ""
+    end
+end
+
+local function teleportHorizontal(targetPosition)
+    if not character.rootPart then return end
+    local currentPos = character.rootPart.Position
+    character.rootPart.CFrame = CFrame.new(targetPosition.X, currentPos.Y, targetPosition.Z)
+    character.rootPart.Velocity = Vector3.new(0,0,0)
+    if not character.floating then setFloating(true) end
+end
+
+-- ========== 传送与甩飞功能 ==========
+local function refreshPlayerList()
+    updatePlayerList()
+    local names = {}
+    for i, name in ipairs(lastPlayerList) do
+        table.insert(names, i..":"..name)
+    end
+    output("在线玩家: " .. table.concat(names, ", "), true)
+end
+
+local function getTargetPlayer()
+    if ui.targetInput and ui.targetInput.Text ~= "" then
+        character.selected_target = ui.targetInput.Text
+    end
+    local targetName = character.selected_target
+    if not targetName or targetName == "" then
+        return nil
+    end
+    return players:FindFirstChild(targetName)
+end
+
+local function teleportToTarget()
+    local target = getTargetPlayer()
+    if not target or not target.Character or not target.Character:FindFirstChild("HumanoidRootPart") then
+        notify("GUS", "无法传送: 目标无效", 3)
+        return
+    end
+    updateCharacterRefs()
+    if not character.rootPart then
+        notify("GUS", "无法获取自身位置", 3)
+        return
+    end
+    local targetPos = target.Character.HumanoidRootPart.Position
+    teleportHorizontal(targetPos + Vector3.new(0, 0, 3))
+    notify("GUS", "已传送到 "..target.Name.." 旁边", 3)
+end
+
+local function toggleLoopTeleportTo(enabled)
+    character.loop_teleport_to = enabled
+    if enabled then
+        task.spawn(function()
+            while character.loop_teleport_to do
+                local target = getTargetPlayer()
+                if target and target.Character and target.Character:FindFirstChild("HumanoidRootPart") then
+                    updateCharacterRefs()
+                    if character.rootPart then
+                        local targetPos = target.Character.HumanoidRootPart.Position
+                        teleportHorizontal(targetPos + Vector3.new(0, 0, 3))
+                    end
+                end
+                task.wait(0.1)
+            end
+        end)
+        notify("GUS", "已开启循环传送到目标", 3)
+    else
+        notify("GUS", "已关闭循环传送到目标", 3)
+    end
+end
+
+local function teleportTargetToMe()
+    local target = getTargetPlayer()
+    if not target or not target.Character or not target.Character:FindFirstChild("HumanoidRootPart") then
+        notify("GUS", "无法传送: 目标无效", 3)
+        return
+    end
+    updateCharacterRefs()
+    if not character.rootPart then
+        notify("GUS", "无法获取自身位置", 3)
+        return
+    end
+    local myPos = character.rootPart.Position
+    target.Character.HumanoidRootPart.CFrame = CFrame.new(myPos + Vector3.new(0, 0, 3))
+    target.Character.HumanoidRootPart.Velocity = Vector3.new(0,0,0)
+    notify("GUS", "已将 "..target.Name.." 传送到身边", 3)
+end
+
+local function toggleLoopTeleportFrom(enabled)
+    character.loop_teleport_from = enabled
+    if enabled then
+        task.spawn(function()
+            while character.loop_teleport_from do
+                local target = getTargetPlayer()
+                if target and target.Character and target.Character:FindFirstChild("HumanoidRootPart") then
+                    updateCharacterRefs()
+                    if character.rootPart then
+                        local myPos = character.rootPart.Position
+                        target.Character.HumanoidRootPart.CFrame = CFrame.new(myPos + Vector3.new(0, 0, 3))
+                        target.Character.HumanoidRootPart.Velocity = Vector3.new(0,0,0)
+                    end
+                end
+                task.wait(0.1)
+            end
+        end)
+        notify("GUS", "已开启循环传送目标到身边", 3)
+    else
+        notify("GUS", "已关闭循环传送目标到身边", 3)
+    end
+end
+
+local function toggleSuckAll(enabled)
+    character.loop_suck_all = enabled
+    if enabled then
+        task.spawn(function()
+            while character.loop_suck_all do
+                updateCharacterRefs()
+                if character.rootPart then
+                    local myPos = character.rootPart.Position
+                    for _, p in ipairs(players:GetPlayers()) do
+                        if p ~= player and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+                            p.Character.HumanoidRootPart.CFrame = CFrame.new(myPos + Vector3.new(0, 0, 3))
+                            p.Character.HumanoidRootPart.Velocity = Vector3.new(0,0,0)
+                        end
+                    end
+                end
+                task.wait(0.1)
+            end
+        end)
+        notify("GUS", "已开启吸全部玩家", 3)
+    else
+        notify("GUS", "已关闭吸全部玩家", 3)
+    end
+end
+
+local function toggleViewPlayer(enabled)
+    character.viewing = enabled
+    if enabled then
+        local target = getTargetPlayer()
+        if target and target.Character and target.Character:FindFirstChildOfClass("Humanoid") then
+            workspace.CurrentCamera.CameraSubject = target.Character:FindFirstChildOfClass("Humanoid")
+            notify("GUS", "正在查看 "..target.Name, 3)
+        else
+            notify("GUS", "目标无效", 3)
+            character.viewing = false
+        end
+    else
+        updateCharacterRefs()
+        if character.humanoid then
+            workspace.CurrentCamera.CameraSubject = character.humanoid
+        end
+        notify("GUS", "已停止查看", 3)
+    end
+    updateUI()
+end
+
+local function flingTargetOnce()
+    local target = getTargetPlayer()
+    if not target then
+        notify("GUS", "请先选择目标", 3)
+        return
+    end
+    local localChar = getCharacter()
+    if not localChar then return end
+    local localHum = localChar:FindFirstChildOfClass("Humanoid")
+    local localRoot = localHum and localHum.RootPart
+    if not localRoot then return end
+
+    local targetChar = target.Character
+    if not targetChar then
+        notify("GUS", "目标角色不存在", 3)
+        return
+    end
+    local targetHum = targetChar:FindFirstChildOfClass("Humanoid")
+    local targetRoot = targetHum and targetHum.RootPart
+    local targetHead = targetChar:FindFirstChild("Head")
+    if not targetRoot and not targetHead then
+        notify("GUS", "目标没有可甩部件", 3)
+        return
+    end
+
+    getgenv().OldPos = localRoot.CFrame
+    getgenv().FPDH = workspace.FallenPartsDestroyHeight
+    workspace.FallenPartsDestroyHeight = 0/0
+
+    if targetHead then
+        workspace.CurrentCamera.CameraSubject = targetHead
+    elseif targetRoot then
+        workspace.CurrentCamera.CameraSubject = targetHum
+    end
+
+    localHum:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+
+    local bv = Instance.new("BodyVelocity")
+    bv.Name = "FlingVelocity"
+    bv.Velocity = Vector3.new(9e7, 9e8, 9e7)
+    bv.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    bv.Parent = localRoot
+
+    local targetPart = targetHead or targetRoot
+    local startTime = tick()
+    local timeout = 3
+
+    while localRoot and targetPart and targetPart.Parent do
+        local dt = tick() - startTime
+        if dt > timeout then break end
+        local angle = dt * 500
+        local offset = CFrame.new(0, 1.5, 0) * CFrame.Angles(0, math.rad(angle), 0)
+        localRoot.CFrame = CFrame.new(targetPart.Position) * offset
+        localChar:SetPrimaryPartCFrame(CFrame.new(targetPart.Position) * offset)
+        task.wait()
+    end
+
+    bv:Destroy()
+    localHum:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
+    workspace.CurrentCamera.CameraSubject = localHum
+
+    repeat
+        localRoot.CFrame = getgenv().OldPos * CFrame.new(0, 0.5, 0)
+        localChar:SetPrimaryPartCFrame(getgenv().OldPos * CFrame.new(0, 0.5, 0))
+        localHum:ChangeState("GettingUp")
+        for _, part in ipairs(localChar:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.Velocity = Vector3.new()
+                part.RotVelocity = Vector3.new()
+            end
+        end
+        task.wait()
+    until (localRoot.Position - getgenv().OldPos.p).Magnitude < 25
+
+    workspace.FallenPartsDestroyHeight = getgenv().FPDH
+    notify("GUS", "甩飞完成", 3)
+end
+
+local function toggleLoopFling(enabled)
+    character.loop_fling = enabled
+    if enabled then
+        task.spawn(function()
+            while character.loop_fling do
+                flingTargetOnce()
+                task.wait(0.5)
+            end
+        end)
+        notify("GUS", "已开启循环甩飞", 3)
+    else
+        notify("GUS", "已关闭循环甩飞", 3)
+    end
+end
+
+local function toggleAimbot(enabled)
+    character.aimbot = enabled
+    if enabled then
+        task.spawn(function()
+            while character.aimbot do
+                local target = getTargetPlayer()
+                if target and target.Character and target.Character:FindFirstChild("HumanoidRootPart") then
+                    local cam = workspace.CurrentCamera
+                    local targetPos = target.Character.HumanoidRootPart.Position
+                    cam.CFrame = CFrame.new(cam.CFrame.Position, targetPos)
+                end
+                task.wait()
+            end
+        end)
+        notify("GUS", "已开启自瞄", 3)
+    else
+        notify("GUS", "已关闭自瞄", 3)
+    end
+end
+
+-- ========== M1 循环 ==========
+local function toggleM1Loop(state)
+    if state == nil then
+        character.m1_enabled = not character.m1_enabled
+    else
+        character.m1_enabled = state
+    end
+    if character.m1_enabled then
+        if m1Loop then task.cancel(m1Loop); m1Loop = nil end
+        m1Loop = task.spawn(function()
+            local remote = game:GetService("ReplicatedStorage"):WaitForChild("CombatRemote")
+            while character and character.m1_enabled do
+                pcall(function()
+                    remote:FireServer("M1")
+                end)
+                task.wait(0.01)
+            end
+        end)
+        if state == nil then output("M1 循环开启", true) end
+    else
+        if m1Loop then
+            task.cancel(m1Loop)
+            m1Loop = nil
+        end
+        if state == nil then output("M1 循环关闭", true) end
+    end
+    updateUI()
+end
+
+-- ========== 格挡循环 ==========
+local function toggleBlock(state)
+    if state == nil then
+        character.block_enabled = not character.block_enabled
+    else
+        character.block_enabled = state
+    end
+    if character.block_enabled then
+        if blockLoop then task.cancel(blockLoop); blockLoop = nil end
+        blockLoop = task.spawn(function()
+            local remote = game:GetService("ReplicatedStorage"):WaitForChild("CombatRemote")
+            while character and character.block_enabled do
+                pcall(function()
+                    remote:FireServer("Block")
+                end)
+                task.wait(0.01)
+            end
+        end)
+        if state == nil then output("格挡循环开启", true) end
+    else
+        if blockLoop then
+            task.cancel(blockLoop)
+            blockLoop = nil
+        end
+        if state == nil then output("格挡循环关闭", true) end
+    end
+    updateUI()
+end
+
+-- ========== M2 循环 ==========
+local function toggleM2Loop(state)
+    if state == nil then
+        character.m2_enabled = not character.m2_enabled
+    else
+        character.m2_enabled = state
+    end
+    if character.m2_enabled then
+        if character.block_enabled then toggleBlock(false) end
+        if m2Loop then task.cancel(m2Loop); m2Loop = nil end
+        m2Loop = task.spawn(function()
+            local remote = game:GetService("ReplicatedStorage"):WaitForChild("CombatRemote")
+            while character and character.m2_enabled do
+                pcall(function()
+                    remote:FireServer("M2")
+                end)
+                task.wait(0.01)
+            end
+        end)
+        if state == nil then output("M2 循环开启", true) end
+    else
+        if m2Loop then
+            task.cancel(m2Loop)
+            m2Loop = nil
+        end
+        if character.block_enabled then toggleBlock(false) end
+        if state == nil then output("M2 循环关闭", true) end
+    end
+    updateUI()
+end
+
+-- ========== 设置格挡恢复时间 ==========
+local function setBlockCooldown(seconds)
+    local s = tonumber(seconds)
+    if not s or s < 0 then
+        output("请输入有效的秒数（≥0）", false)
+        return
+    end
+    character.block_cooldown = s
+    output("格挡恢复时间已设为 "..s.." 秒", true)
+end
+
+-- ========== 设置跟随高度偏移 ==========
+local function setFollowHeightOffset(offset)
+    local o = tonumber(offset)
+    if not o then
+        output("请输入有效的数字", false)
+        return
+    end
+    character.follow_height_offset = o
+    output("跟随头顶偏移设为 " .. o, true)
+    updateUI()
+end
+
+-- ========== Y锁定控制 ==========
+local function toggleYLock(state)
+    if state == nil then
+        character.y_lock_enabled = not character.y_lock_enabled
+    else
+        character.y_lock_enabled = state
+    end
+    output("Y锁定 " .. (character.y_lock_enabled and "开启" or "关闭"), true)
+    updateUI()
+end
+
+local function setYLockValue(value)
+    local v = tonumber(value)
+    if not v then
+        output("请输入有效数字", false)
+        return
+    end
+    character.y_lock_value = v
+    output("Y锁定高度设为 " .. v, true)
+    updateUI()
+end
+
+-- ========== 范围功能（新：GUST风格，修改目标碰撞箱）==========
+local function updateHitboxes()
+    if not character.hitbox_enabled then
+        -- 关闭范围时，恢复所有玩家的RootPart原始属性
+        for _, p in ipairs(players:GetPlayers()) do
+            if p ~= player then
+                local char = p.Character
+                if char then
+                    local root = char:FindFirstChild("HumanoidRootPart")
+                    if root then
+                        root.Size = Vector3.new(2, 2, 1)
+                        root.Transparency = 0
+                        root.BrickColor = BrickColor.new("Medium stone grey")
+                        root.Material = Enum.Material.Plastic
+                        root.CanCollide = true
+                    end
+                end
+            end
+        end
+        return
+    end
+
+    -- 开启范围时，遍历所有其他玩家
+    for _, p in ipairs(players:GetPlayers()) do
+        if p ~= player then
+            -- 队伍检测
+            if character.hitbox_teamCheck and player.Team == p.Team then
+                -- 同队伍，跳过
+            else
+                local char = p.Character
+                if char then
+                    local root = char:FindFirstChild("HumanoidRootPart")
+                    if root then
+                        -- 免疫玩家恢复原状
+                        if hitboxImmunePlayers[p.Name] then
+                            root.Size = Vector3.new(2, 2, 1)
+                            root.Transparency = 0
+                            root.BrickColor = BrickColor.new("Medium stone grey")
+                            root.Material = Enum.Material.Plastic
+                            root.CanCollide = true
+                        else
+                            -- 修改碰撞箱大小、透明度、材质、颜色、碰撞状态
+                            root.Size = Vector3.new(character.hitbox_size, character.hitbox_size, character.hitbox_size)
+                            root.Transparency = character.hitbox_transparency
+                            root.BrickColor = character.hitbox_color
+                            root.Material = Enum.Material.Neon
+                            root.CanCollide = false
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function toggleHitbox(enabled)
+    if enabled == nil then
+        character.hitbox_enabled = not character.hitbox_enabled
+    else
+        character.hitbox_enabled = enabled
+    end
+
+    if character.hitbox_enabled then
+        if character.hitbox_connection then
+            character.hitbox_connection:Disconnect()
+        end
+        character.hitbox_connection = runService.RenderStepped:Connect(updateHitboxes)
+        output("范围开启，大小 " .. character.hitbox_size, true)
+    else
+        if character.hitbox_connection then
+            character.hitbox_connection:Disconnect()
+            character.hitbox_connection = nil
+            updateHitboxes()  -- 立即恢复所有目标
+        end
+        output("范围关闭", true)
+    end
+    updateUI()
+end
+
+local function setHitboxSize(size)
+    local s = tonumber(size)
+    if not s or s < 1 then
+        output("请输入有效数字（≥1）", false)
+        return
+    end
+    character.hitbox_size = s
+    output("范围大小设为 " .. s, true)
+    updateUI()
+end
+
+local function setHitboxTransparency(trans)
+    local t = tonumber(trans)
+    if not t or t < 0 or t > 1 then
+        output("透明度须为 0~1 的数字", false)
+        return
+    end
+    character.hitbox_transparency = t
+    output("范围透明度设为 " .. t, true)
+    updateUI()
+end
+
+local function setHitboxColor(colorName)
+    local bc = BrickColor.new(colorName)
+    if bc == BrickColor.new("White") and colorName ~= "White" then
+        output("无效颜色名称", false)
+        return
+    end
+    character.hitbox_color = bc
+    character.hitbox_colorName = colorName
+    output("范围颜色设为 " .. colorName, true)
+    updateUI()
+end
+
+local function toggleTeamCheck()
+    character.hitbox_teamCheck = not character.hitbox_teamCheck
+    output("队伍检测 " .. (character.hitbox_teamCheck and "开启" or "关闭"), true)
+    updateUI()
+end
+
+-- ========== 自在极意 ==========
+local function toggleKuangkai(state)
+    if state == nil then
+        character.kuangkai_enabled = not character.kuangkai_enabled
+    else
+        character.kuangkai_enabled = state
+    end
+
+    if character.kuangkai_enabled then
+        if character.kuangkai_thread then task.cancel(character.kuangkai_thread) end
+
+        if not character.follow_target then
+            output("请先设置跟随目标（.f <玩家名>）", false)
+            character.kuangkai_enabled = false
+            return
+        end
+
+        character.kuangkai_thread = task.spawn(function()
+            local angle = 0
+            local distance = 14
+            local speed = 0.1
+            
+            while character.kuangkai_enabled do
+                local targetName = character.follow_target
+                if not targetName then
+                    output("目标丢失，停止自在极意", true)
+                    character.kuangkai_enabled = false
+                    break
+                end
+
+                local targetPlayer = players:FindFirstChild(targetName)
+                if not targetPlayer or not targetPlayer.Character then
+                    output("目标角色不存在，停止自在极意", true)
+                    character.kuangkai_enabled = false
+                    break
+                end
+
+                local targetHum = targetPlayer.Character:FindFirstChildOfClass("Humanoid")
+                local targetPart = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+                
+                if not targetHum or targetHum.Health <= 0 or not targetPart then
+                    output("目标已死亡或无效，停止自在极意", true)
+                    character.kuangkai_enabled = false
+                    break
+                end
+
+                updateCharacterRefs()
+                if not character.rootPart then
+                    task.wait(0.5)
+                    continue
+                end
+
+                local targetPos = targetPart.Position
+
+                local offsetX = math.cos(angle) * distance
+                local offsetZ = math.sin(angle) * distance
+                local newPos = Vector3.new(
+                    targetPos.X + offsetX,
+                    targetPos.Y + 2,
+                    targetPos.Z + offsetZ
+                )
+
+                character.rootPart.CFrame = CFrame.lookAt(newPos, targetPos)
+                character.rootPart.Velocity = Vector3.new(0,0,0)
+                if not character.floating then setFloating(true) end
+
+                local cam = workspace.CurrentCamera
+                cam.CameraType = Enum.CameraType.Scriptable
+                local camDistance = 20
+                local camHeight = 8
+                local camPos = targetPos + Vector3.new(math.cos(angle) * camDistance, camHeight, math.sin(angle) * camDistance)
+                cam.CFrame = CFrame.lookAt(camPos, targetPos)
+
+                angle = angle + speed
+
+                if angle % (math.pi) < speed then
+                    distance = (distance == 14) and 20 or 14
+                end
+
+                if angle > 2 * math.pi then
+                    angle = angle - 2 * math.pi
+                end
+
+                task.wait(0.05)
+            end
+
+            updateCharacterRefs()
+            if character.humanoid then
+                workspace.CurrentCamera.CameraSubject = character.humanoid
+                workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+            end
+        end)
+        output("自在极意开启：上帝视角环绕目标", true)
+    else
+        if character.kuangkai_thread then
+            task.cancel(character.kuangkai_thread)
+            character.kuangkai_thread = nil
+        end
+        updateCharacterRefs()
+        if character.humanoid then
+            workspace.CurrentCamera.CameraSubject = character.humanoid
+            workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+        end
+        output("自在极意关闭", true)
+    end
+    updateUI()
+end
+
+-- ========== 自动自杀 ==========
+local function toggleAutoSuicide()
+    character.auto_suicide = not character.auto_suicide
+    output("自动自杀 " .. (character.auto_suicide and "开启" or "关闭"), true)
+    updateUI()
+end
+
+-- ========== 跟随 ==========
+local function stopFollow()
+    if character.follow_target then
+        character.follow_target = nil
+        if followLoop then task.cancel(followLoop); followLoop = nil end
+        output("停止跟随", true)
+        updateUI()
+    end
+end
+
+local function startFollow(targetName)
+    if character.follow_target then stopFollow() end
+    local targetPlayer = players:FindFirstChild(targetName)
+    if not targetPlayer then output("玩家 "..targetName.." 不在线，但将继续等待...", true) end
+    character.follow_target = targetName
+    if followLoop then task.cancel(followLoop); followLoop = nil end
+    followLoop = task.spawn(function()
+        local waitTimer = 0
+        while character and character.follow_target do
+            local target = players:FindFirstChild(character.follow_target)
+            if target and target.Character and target.Character:FindFirstChild("HumanoidRootPart") then
+                updateCharacterRefs()
+                if character and character.rootPart then
+                    local targetChar = target.Character
+                    local targetPart = targetChar:FindFirstChild("HumanoidRootPart")
+                    local targetHead = targetChar:FindFirstChild("Head")
+                    local targetBaseY = targetHead and targetHead.Position.Y or (targetPart.Position.Y + 2.5)
+                    local targetY = targetBaseY + character.follow_height_offset
+                    local targetPos = targetPart.Position
+                    
+                    if character.prediction_enabled then
+                        local predictedPos = getPredictedPosition(0.2)
+                        if predictedPos then
+                            targetPos = predictedPos
+                        end
+                    end
+
+                    if character.smooth_follow then
+                        local currentPos = character.rootPart.Position
+                        character.rootPart.CFrame = CFrame.new(currentPos.X, targetY, currentPos.Z)
+                        smoothMoveHorizontal(Vector3.new(targetPos.X, targetY, targetPos.Z))
+                    else
+                        character.rootPart.CFrame = CFrame.new(targetPos.X, targetY, targetPos.Z)
+                        character.rootPart.Velocity = Vector3.new(0,0,0)
+                        if not character.floating then setFloating(true) end
+                    end
+                end
+                waitTimer = 0
+                task.wait(character.follow_interval)
+            else
+                waitTimer = waitTimer + 1
+                if waitTimer > 30 then waitTimer = 30 end
+                task.wait(0.1 * waitTimer)
+            end
+        end
+    end)
+    output("开始跟随 "..targetName.." (头顶偏移+"..character.follow_height_offset..")", true)
+    sendChatMessage("☠️狩猎 " .. targetName .. "！！！☠️", "All")
+    updateUI()
+end
+
+local function followNearest()
+    local nearest = getNearestPlayerName()
+    if nearest then
+        startFollow(nearest)
+    else
+        output("附近没有其他玩家", false)
+    end
+end
+
+local function toggleFollowMode()
+    character.smooth_follow = not character.smooth_follow
+    output("跟随模式已切换为 "..(character.smooth_follow and "平滑移动" or "瞬间传送"), true)
+    updateUI()
+end
+
+local function setFollowInterval(value)
+    local interval = tonumber(value)
+    if not interval or interval < 0.01 then
+        output("请输入有效的数字（≥0.01）", false)
+        return
+    end
+    character.follow_interval = interval
+    output("跟随间隔已设为 "..interval.." 秒", true)
+    if character.follow_target then
+        local target = character.follow_target
+        stopFollow()
+        startFollow(target)
+    end
+end
+
+-- ========== UI更新（添加判空） ==========
+local function updateUI()
+    -- 修复：检查 UI 元素是否存在，避免 nil 访问
+    if not ui or not ui.statusText then return end
+    local success, err = pcall(function()
+        updateCharacterRefs()
+        local currentY = character.rootPart and math.floor(character.rootPart.Position.Y * 10) / 10 or 0
+        if ui.statusText and ui.statusText.Parent then
+            local follow_text = character.follow_target and "跟随:"..character.follow_target or "跟随:无"
+            local immune_count = 0
+            for _,_ in pairs(damageImmunityList) do immune_count = immune_count + 1 end
+            local immune_text = "免伤:" .. immune_count .. "人"
+            
+            local status = 
+                "穿墙:" .. (character.immunity and "ON(永不中断)" or "OFF") .. " " .. immune_text .. "\n" ..
+                "悬浮:" .. (character.floating and "ON" or "OFF") .. "\n" ..
+                "格挡循环:" .. (character.block_enabled and "ON" or "OFF") .. "  (破碎暂停 "..character.block_cooldown.."s)\n" ..
+                "M1循环:" .. (character.m1_enabled and "ON" or "OFF") .. "  M2循环:" .. (character.m2_enabled and "ON" or "OFF") .. "\n" ..
+                "自动自杀:" .. (character.auto_suicide and "ON" or "OFF") .. "\n" ..
+                follow_text .. "\n" ..
+                "速度:" .. character.speed .. " Y:" .. currentY .. "("..MIN_HEIGHT.."~"..MAX_HEIGHT..")\n" ..
+                "旋转:" .. (character.spin_enabled and "ON" or "OFF") .. " 速度:" .. character.spin_speed .. "\n" ..
+                "范围:" .. (character.hitbox_enabled and "ON" or "OFF") .. " 大小:" .. character.hitbox_size .. "\n" ..
+                "传送循环: " .. (character.loop_teleport_to and "→目标" or "") .. (character.loop_teleport_from and "目标→" or "") .. (character.loop_suck_all and "吸全部" or "") .. "\n" ..
+                "甩飞循环: " .. (character.loop_fling and "ON" or "OFF") .. " 自瞄: " .. (character.aimbot and "ON" or "OFF") .. " 查看: " .. (character.viewing and "ON" or "OFF") .. "\n" ..
+                "无限跳: " .. (character.infinite_jump and "ON" or "OFF") .. " 跟随间隔: " .. character.follow_interval .. "s\n" ..
+                "目标: " .. (character.selected_target or "未选") .. "\n" ..
+                "跟随模式:" .. (character.smooth_follow and "平滑" or "瞬移") .. " | 头顶偏移:+" .. character.follow_height_offset .. "\n" ..
+                "Y锁定:" .. (character.y_lock_enabled and "ON" or "OFF") .. " 锁定高度:" .. character.y_lock_value .. "\n" ..
+                "自在极意:" .. (character.kuangkai_enabled and "ON" or "OFF") .. "\n" ..
+                "预判:" .. (character.prediction_enabled and "ON" or "OFF")
+            ui.statusText.Text = status
+        end
+        local btnUpdates = {
+            {ui.immunityBtn, character.immunity and "穿墙开(永不中断)" or "穿墙关"},
+            {ui.floatBtn, character.floating and "悬浮开" or "悬浮关"},
+            {ui.smoothFollowBtn, character.smooth_follow and "平滑跟随" or "瞬移跟随"},
+            {ui.spinBtn, character.spin_enabled and "旋转开" or "旋转关"},
+            {ui.hitboxBtn, character.hitbox_enabled and "范围开" or "范围关"},
+            {ui.teamCheckBtn, character.hitbox_teamCheck and "队伍检测开" or "队伍检测关"},
+            {ui.loopToBtn, character.loop_teleport_to and "循环传送关" or "循环传送开"},
+            {ui.loopFromBtn, character.loop_teleport_from and "循环拉回关" or "循环拉回开"},
+            {ui.suckAllBtn, character.loop_suck_all and "吸全部关" or "吸全部开"},
+            {ui.viewBtn, character.viewing and "查看关" or "查看开"},
+            {ui.loopFlingBtn, character.loop_fling and "循环甩飞关" or "循环甩飞开"},
+            {ui.aimbotBtn, character.aimbot and "自瞄关" or "自瞄开"},
+            {ui.infiniteJumpBtn, character.infinite_jump and "无限跳关" or "无限跳开"},
+            {ui.blockBtn, character.block_enabled and "格挡循环关" or "格挡循环开"},
+            {ui.m1Btn, character.m1_enabled and "M1循环关" or "M1循环开"},
+            {ui.m2Btn, character.m2_enabled and "M2循环关" or "M2循环开"},
+            {ui.autoSuicideBtn, character.auto_suicide and "自动自杀关" or "自动自杀开"},
+            {ui.yLockBtn, character.y_lock_enabled and "Y锁定开" or "Y锁定关"},
+            {ui.kuangkaiBtn, character.kuangkai_enabled and "自在极意关" or "自在极意开"},
+            {ui.predictionBtn, character.prediction_enabled and "预判关" or "预判开"},
+        }
+        for _, update in ipairs(btnUpdates) do
+            local btn, text = update[1], update[2]
+            if btn and btn.Parent then btn.Text = text end
+        end
+        if ui.heightInput and ui.heightInput.Parent and character.rootPart then
+            ui.heightInput.PlaceholderText = tostring(math.floor(character.rootPart.Position.Y))
+        end
+        if ui.fhInput and ui.fhInput.Parent then
+            ui.fhInput.PlaceholderText = "当前:" .. character.follow_height_offset
+        end
+        if ui.yLockInput and ui.yLockInput.Parent then
+            ui.yLockInput.PlaceholderText = "当前:" .. character.y_lock_value
+        end
+    end)
+    if not success then warn("更新UI失败:", err) end
+end
+
+-- ========== 加载动画 ==========
+local function showLoadingScreen()
+    local playerGui = player:WaitForChild("PlayerGui")
+    
+    local loadingScreen = Instance.new("ScreenGui")
+    loadingScreen.Name = "LoadingScreen"
+    loadingScreen.ResetOnSpawn = false
+    loadingScreen.Parent = playerGui
+    ui.loadingScreen = loadingScreen
+    
+    local background = Instance.new("Frame")
+    background.Size = UDim2.new(1, 0, 1, 0)
+    background.BackgroundColor3 = Color3.new(0, 0, 0)
+    background.BackgroundTransparency = 0.6
+    background.Parent = loadingScreen
+    
+    local imageContainer = Instance.new("Frame")
+    imageContainer.Size = UDim2.new(0, 200, 0, 250)
+    imageContainer.Position = UDim2.new(0.5, -100, 0.5, -125)
+    imageContainer.BackgroundTransparency = 1
+    imageContainer.Parent = loadingScreen
+    
+    local loadingImage = Instance.new("ImageLabel")
+    loadingImage.Size = UDim2.new(1, 0, 0.8, 0)
+    loadingImage.Position = UDim2.new(0, 0, 0, 0)
+    loadingImage.BackgroundTransparency = 1
+    loadingImage.Image = "rbxassetid://127495408038944"
+    loadingImage.ScaleType = Enum.ScaleType.Fit
+    loadingImage.Parent = imageContainer
+    ui.loadingImage = loadingImage
+    
+    local welcomeText = Instance.new("TextLabel")
+    welcomeText.Size = UDim2.new(1, 0, 0.2, 0)
+    welcomeText.Position = UDim2.new(0, 0, 0.8, 0)
+    welcomeText.BackgroundTransparency = 1
+    welcomeText.Text = "欢迎使用"
+    welcomeText.TextColor3 = Color3.new(1, 1, 1)
+    welcomeText.TextScaled = true
+    welcomeText.Font = Enum.Font.SourceSansBold
+    welcomeText.TextStrokeTransparency = 0.5
+    welcomeText.TextStrokeColor3 = Color3.new(0, 1, 0)
+    welcomeText.Parent = imageContainer
+    ui.loadingText = welcomeText
+    
+    local loadingText = Instance.new("TextLabel")
+    loadingText.Size = UDim2.new(1, 0, 0.05, 0)
+    loadingText.Position = UDim2.new(0, 0, 0.95, 0)
+    loadingText.BackgroundTransparency = 1
+    loadingText.Text = "加载中..."
+    loadingText.TextColor3 = Color3.new(1, 1, 1)
+    loadingText.TextScaled = true
+    loadingText.Font = Enum.Font.SourceSans
+    loadingText.TextStrokeTransparency = 0.7
+    loadingText.Parent = loadingScreen
+    
+    local spinTweenInfo = TweenInfo.new(2, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, true)
+    local spinGoal = { Rotation = 360 }
+    local spinTween = tweenService:Create(loadingImage, spinTweenInfo, spinGoal)
+    spinTween:Play()
+    
+    local fadeTweenInfo = TweenInfo.new(1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
+    local fadeGoal = { TextTransparency = 0.5 }
+    local fadeTween = tweenService:Create(welcomeText, fadeTweenInfo, fadeGoal)
+    fadeTween:Play()
+    
+    task.wait(3)
+    
+    if loadingScreen and loadingScreen.Parent then
+        local hideTweenInfo = TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+        for _, child in ipairs(loadingScreen:GetDescendants()) do
+            if child:IsA("ImageLabel") then
+                tweenService:Create(child, hideTweenInfo, {ImageTransparency = 1}):Play()
+            elseif child:IsA("TextLabel") then
+                tweenService:Create(child, hideTweenInfo, {TextTransparency = 1}):Play()
+            elseif child:IsA("Frame") and child ~= loadingScreen then
+                tweenService:Create(child, hideTweenInfo, {BackgroundTransparency = 1}):Play()
+            end
+        end
+        task.wait(0.5)
+        loadingScreen:Destroy()
+        ui.loadingScreen = nil
+        ui.loadingImage = nil
+        ui.loadingText = nil
+    end
+end
+
+-- ========== 创建UI ==========
+local function createUI()
+    local playerGui = player:WaitForChild("PlayerGui")
+    if ui.screenGui then pcall(function() ui.screenGui:Destroy() end); ui.screenGui = nil end
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "DarkControlUI"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = playerGui
+    ui.screenGui = screenGui
+
+    local mainFrame = Instance.new("Frame")
+    mainFrame.Size = UDim2.new(0, 420, 1, 0)
+    mainFrame.Position = UDim2.new(0, 10, 0, 0)
+    mainFrame.BackgroundColor3 = Color3.new(0.1, 0.1, 0.1)
+    mainFrame.BackgroundTransparency = 0.3
+    mainFrame.BorderSizePixel = 2
+    mainFrame.BorderColor3 = Color3.new(0, 1, 0)
+    mainFrame.Active = true
+    mainFrame.Parent = screenGui
+    ui.mainFrame = mainFrame
+
+    local backgroundImage = Instance.new("ImageLabel")
+    backgroundImage.Size = UDim2.new(1, 0, 1, 0)
+    backgroundImage.Position = UDim2.new(0, 0, 0, 0)
+    backgroundImage.BackgroundTransparency = 1
+    backgroundImage.Image = "rbxassetid:// 73410876234472"
+    backgroundImage.ScaleType = Enum.ScaleType.Crop
+    backgroundImage.ImageTransparency = 0.2
+    backgroundImage.Parent = mainFrame
+    
+    local overlay = Instance.new("Frame")
+    overlay.Size = UDim2.new(1, 0, 1, 0)
+    overlay.Position = UDim2.new(0, 0, 0, 0)
+    overlay.BackgroundColor3 = Color3.new(0, 0, 0)
+    overlay.BackgroundTransparency = 0.4
+    overlay.BorderSizePixel = 0
+    overlay.Parent = mainFrame
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 20)
+    title.BackgroundTransparency = 1
+    title.Text = "qdsdz专用机器人（范围修改碰撞箱）"
+    title.TextColor3 = Color3.new(0, 1, 0)
+    title.TextScaled = true
+    title.Font = Enum.Font.SourceSansBold
+    title.Parent = mainFrame
+
+    local scrollFrame = Instance.new("ScrollingFrame")
+    scrollFrame.Size = UDim2.new(1, 0, 1, -20)
+    scrollFrame.Position = UDim2.new(0, 0, 0, 20)
+    scrollFrame.BackgroundTransparency = 1
+    scrollFrame.BorderSizePixel = 0
+    scrollFrame.ScrollBarThickness = 8
+    scrollFrame.ScrollingEnabled = true
+    scrollFrame.CanvasSize = UDim2.new(0, 0, 0, 2000)
+    scrollFrame.Parent = mainFrame
+    ui.scrollFrame = scrollFrame
+
+    local yOffset = -20
+    local currentY = 23
+
+    local statusLabel = Instance.new("TextLabel")
+    statusLabel.Size = UDim2.new(1, -6, 0, 320)
+    statusLabel.Position = UDim2.new(0, 3, 0, currentY + yOffset)
+    statusLabel.BackgroundColor3 = Color3.new(0.2, 0.2, 0.2)
+    statusLabel.TextColor3 = Color3.new(1, 1, 1)
+    statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    statusLabel.TextYAlignment = Enum.TextYAlignment.Top
+    statusLabel.TextWrapped = true
+    statusLabel.TextScaled = true
+    statusLabel.Font = Enum.Font.SourceSans
+    statusLabel.Parent = scrollFrame
+    ui.statusText = statusLabel
+    currentY = currentY + 325
+
+    local btnImmunity = Instance.new("TextButton")
+    btnImmunity.Size = UDim2.new(0.45, -2, 0, 25)
+    btnImmunity.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    btnImmunity.Text = "穿墙关"
+    btnImmunity.BackgroundColor3 = Color3.new(0.2, 0.8, 0.2)
+    btnImmunity.Parent = scrollFrame
+    btnImmunity.MouseButton1Click:Connect(function() setImmunity(not character.immunity) end)
+    ui.immunityBtn = btnImmunity
+
+    local btnReset = Instance.new("TextButton")
+    btnReset.Size = UDim2.new(0.45, -2, 0, 25)
+    btnReset.Position = UDim2.new(0.5, 0, 0, currentY + yOffset)
+    btnReset.Text = "重置"
+    btnReset.BackgroundColor3 = Color3.new(0.3, 0.3, 1)
+    btnReset.Parent = scrollFrame
+    btnReset.MouseButton1Click:Connect(resetCharacter)
+    currentY = currentY + 28
+
+    local btnSpeed = Instance.new("TextButton")
+    btnSpeed.Size = UDim2.new(0.3, -2, 0, 25)
+    btnSpeed.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    btnSpeed.Text = "速度+"
+    btnSpeed.BackgroundColor3 = Color3.new(0.6, 0.2, 0.8)
+    btnSpeed.Parent = scrollFrame
+    btnSpeed.MouseButton1Click:Connect(adjustSpeed)
+
+    local btnFloat = Instance.new("TextButton")
+    btnFloat.Size = UDim2.new(0.3, -2, 0, 25)
+    btnFloat.Position = UDim2.new(0.35, 0, 0, currentY + yOffset)
+    btnFloat.Text = "悬浮关"
+    btnFloat.BackgroundColor3 = Color3.new(0, 0.8, 0.8)
+    btnFloat.Parent = scrollFrame
+    btnFloat.MouseButton1Click:Connect(function() setFloating(not character.floating) end)
+    ui.floatBtn = btnFloat
+
+    local smoothFollowBtn = Instance.new("TextButton")
+    smoothFollowBtn.Size = UDim2.new(0.3, -2, 0, 25)
+    smoothFollowBtn.Position = UDim2.new(0.65, 0, 0, currentY + yOffset)
+    smoothFollowBtn.Text = "平滑跟随"
+    smoothFollowBtn.BackgroundColor3 = Color3.new(0.5, 0.8, 0.5)
+    smoothFollowBtn.Parent = scrollFrame
+    smoothFollowBtn.MouseButton1Click:Connect(toggleFollowMode)
+    ui.smoothFollowBtn = smoothFollowBtn
+    currentY = currentY + 28
+
+    local btnPlayers = Instance.new("TextButton")
+    btnPlayers.Size = UDim2.new(0.45, -2, 0, 25)
+    btnPlayers.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    btnPlayers.Text = "玩家列表"
+    btnPlayers.BackgroundColor3 = Color3.new(0.2, 0.6, 1)
+    btnPlayers.Parent = scrollFrame
+    btnPlayers.MouseButton1Click:Connect(refreshPlayerList)
+
+    local btnView = Instance.new("TextButton")
+    btnView.Size = UDim2.new(0.45, -2, 0, 25)
+    btnView.Position = UDim2.new(0.5, 0, 0, currentY + yOffset)
+    btnView.Text = "查看开"
+    btnView.BackgroundColor3 = Color3.new(0, 0.8, 0.8)
+    btnView.Parent = scrollFrame
+    btnView.MouseButton1Click:Connect(function() toggleViewPlayer(not character.viewing) end)
+    ui.viewBtn = btnView
+    currentY = currentY + 28
+
+    local btnBlock = Instance.new("TextButton")
+    btnBlock.Size = UDim2.new(0.23, -2, 0, 25)
+    btnBlock.Position = UDim2.new(0.02, 0, 0, currentY + yOffset)
+    btnBlock.Text = "格挡循环开"
+    btnBlock.BackgroundColor3 = Color3.new(0.2, 0.4, 1)
+    btnBlock.Parent = scrollFrame
+    btnBlock.MouseButton1Click:Connect(toggleBlock)
+    ui.blockBtn = btnBlock
+
+    local btnM1 = Instance.new("TextButton")
+    btnM1.Size = UDim2.new(0.23, -2, 0, 25)
+    btnM1.Position = UDim2.new(0.25, 0, 0, currentY + yOffset)
+    btnM1.Text = "M1循环开"
+    btnM1.BackgroundColor3 = Color3.new(1, 0.2, 0.2)
+    btnM1.Parent = scrollFrame
+    btnM1.MouseButton1Click:Connect(toggleM1Loop)
+    ui.m1Btn = btnM1
+
+    local btnM2 = Instance.new("TextButton")
+    btnM2.Size = UDim2.new(0.23, -2, 0, 25)
+    btnM2.Position = UDim2.new(0.48, 0, 0, currentY + yOffset)
+    btnM2.Text = "M2循环开"
+    btnM2.BackgroundColor3 = Color3.new(1, 0.5, 0)
+    btnM2.Parent = scrollFrame
+    btnM2.MouseButton1Click:Connect(toggleM2Loop)
+    ui.m2Btn = btnM2
+
+    local btnCombo = Instance.new("TextButton")
+    btnCombo.Size = UDim2.new(0.23, -2, 0, 25)
+    btnCombo.Position = UDim2.new(0.71, 0, 0, currentY + yOffset)
+    btnCombo.Text = "组合开关"
+    btnCombo.BackgroundColor3 = Color3.new(0.5, 0, 1)
+    btnCombo.Parent = scrollFrame
+    btnCombo.MouseButton1Click:Connect(function()
+        local any_on = character.block_enabled or character.m1_enabled or character.m2_enabled
+        if any_on then
+            if character.block_enabled then toggleBlock(false) end
+            if character.m1_enabled then toggleM1Loop(false) end
+            if character.m2_enabled then toggleM2Loop(false) end
+            output("所有攻击循环已关闭", true)
+        else
+            if not character.block_enabled then toggleBlock(true) end
+            if not character.m1_enabled then toggleM1Loop(true) end
+            if not character.m2_enabled then toggleM2Loop(true) end
+            output("所有攻击循环已开启", true)
+        end
+    end)
+    ui.comboBtn = btnCombo
+    currentY = currentY + 28
+
+    local btnAutoSuicide = Instance.new("TextButton")
+    btnAutoSuicide.Size = UDim2.new(0.3, -2, 0, 25)
+    btnAutoSuicide.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    btnAutoSuicide.Text = "自动自杀开"
+    btnAutoSuicide.BackgroundColor3 = Color3.new(0, 0.8, 0.2)
+    btnAutoSuicide.Parent = scrollFrame
+    btnAutoSuicide.MouseButton1Click:Connect(toggleAutoSuicide)
+    ui.autoSuicideBtn = btnAutoSuicide
+
+    local cdLabel = Instance.new("TextLabel")
+    cdLabel.Size = UDim2.new(0.25, -3, 0, 25)
+    cdLabel.Position = UDim2.new(0.35, 0, 0, currentY + yOffset)
+    cdLabel.BackgroundTransparency = 1
+    cdLabel.Text = "格挡恢复:"
+    cdLabel.TextColor3 = Color3.new(1, 1, 1)
+    cdLabel.TextXAlignment = Enum.TextXAlignment.Right
+    cdLabel.TextScaled = true
+    cdLabel.Font = Enum.Font.SourceSans
+    cdLabel.Parent = scrollFrame
+
+    local cdInput = Instance.new("TextBox")
+    cdInput.Size = UDim2.new(0.2, -4, 0, 25)
+    cdInput.Position = UDim2.new(0.6, 0, 0, currentY + yOffset)
+    cdInput.PlaceholderText = "秒"
+    cdInput.Text = tostring(character.block_cooldown)
+    cdInput.BackgroundColor3 = Color3.new(0.3, 0.3, 0.3)
+    cdInput.TextColor3 = Color3.new(1, 1, 1)
+    cdInput.TextScaled = true
+    cdInput.Font = Enum.Font.SourceSans
+    cdInput.Parent = scrollFrame
+    ui.blockCdInput = cdInput
+
+    local setCdBtn = Instance.new("TextButton")
+    setCdBtn.Size = UDim2.new(0.15, -2, 0, 25)
+    setCdBtn.Position = UDim2.new(0.8, 0, 0, currentY + yOffset)
+    setCdBtn.Text = "设置"
+    setCdBtn.BackgroundColor3 = Color3.new(0.2, 0.6, 1)
+    setCdBtn.TextScaled = true
+    setCdBtn.Font = Enum.Font.SourceSans
+    setCdBtn.Parent = scrollFrame
+    setCdBtn.MouseButton1Click:Connect(function() setBlockCooldown(cdInput.Text) end)
+    ui.setBlockCdBtn = setCdBtn
+    currentY = currentY + 30
+
+    local predictionBtn = Instance.new("TextButton")
+    predictionBtn.Size = UDim2.new(0.3, -2, 0, 25)
+    predictionBtn.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    predictionBtn.Text = "预判开"
+    predictionBtn.BackgroundColor3 = Color3.new(0.5, 0, 0.5)
+    predictionBtn.Parent = scrollFrame
+    predictionBtn.MouseButton1Click:Connect(togglePrediction)
+    ui.predictionBtn = predictionBtn
+    
+    local kuangkaiBtn = Instance.new("TextButton")
+    kuangkaiBtn.Size = UDim2.new(0.3, -2, 0, 25)
+    kuangkaiBtn.Position = UDim2.new(0.35, 0, 0, currentY + yOffset)
+    kuangkaiBtn.Text = "自在极意开"
+    kuangkaiBtn.BackgroundColor3 = Color3.new(1, 0.5, 0)
+    kuangkaiBtn.Parent = scrollFrame
+    kuangkaiBtn.MouseButton1Click:Connect(function() toggleKuangkai(not character.kuangkai_enabled) end)
+    ui.kuangkaiBtn = kuangkaiBtn
+    
+    local manualSuicideBtn = Instance.new("TextButton")
+    manualSuicideBtn.Size = UDim2.new(0.3, -2, 0, 25)
+    manualSuicideBtn.Position = UDim2.new(0.65, 0, 0, currentY + yOffset)
+    manualSuicideBtn.Text = "立即自杀"
+    manualSuicideBtn.BackgroundColor3 = Color3.new(1, 0, 0)
+    manualSuicideBtn.Parent = scrollFrame
+    manualSuicideBtn.MouseButton1Click:Connect(function()
+        local char = getCharacter()
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then hum.Health = 0 end
+            char:BreakJoints()
+        end
+    end)
+    ui.manualSuicideBtn = manualSuicideBtn
+    currentY = currentY + 28
+
+    -- 高度控制
+    local heightLabel = Instance.new("TextLabel")
+    heightLabel.Size = UDim2.new(0.4, -3, 0, 16)
+    heightLabel.Position = UDim2.new(0, 3, 0, currentY + yOffset)
+    heightLabel.BackgroundTransparency = 1
+    heightLabel.Text = "高度:"
+    heightLabel.TextColor3 = Color3.new(1, 1, 1)
+    heightLabel.TextXAlignment = Enum.TextXAlignment.Left
+    heightLabel.TextScaled = true
+    heightLabel.Font = Enum.Font.SourceSans
+    heightLabel.Parent = scrollFrame
+
+    local heightInput = Instance.new("TextBox")
+    heightInput.Size = UDim2.new(0.6, -4, 0, 18)
+    heightInput.Position = UDim2.new(0.4, 0, 0, currentY + yOffset)
+    heightInput.PlaceholderText = "输入高度"
+    heightInput.Text = ""
+    heightInput.BackgroundColor3 = Color3.new(0.3, 0.3, 0.3)
+    heightInput.TextColor3 = Color3.new(1, 1, 1)
+    heightInput.TextScaled = true
+    heightInput.Font = Enum.Font.SourceSans
+    heightInput.Parent = scrollFrame
+    ui.heightInput = heightInput
+    currentY = currentY + 21
+
+    local heightSetBtn = Instance.new("TextButton")
+    heightSetBtn.Size = UDim2.new(0.45, -2, 0, 18)
+    heightSetBtn.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    heightSetBtn.Text = "设置高度"
+    heightSetBtn.BackgroundColor3 = Color3.new(0.2, 0.6, 1)
+    heightSetBtn.TextScaled = true
+    heightSetBtn.Font = Enum.Font.SourceSans
+    heightSetBtn.Parent = scrollFrame
+    heightSetBtn.MouseButton1Click:Connect(function() setCharacterHeight(heightInput.Text) end)
+    ui.heightSetBtn = heightSetBtn
+
+    local heightUpBtn = Instance.new("TextButton")
+    heightUpBtn.Size = UDim2.new(0.22, -2, 0, 18)
+    heightUpBtn.Position = UDim2.new(0.5, 0, 0, currentY + yOffset)
+    heightUpBtn.Text = "+10"
+    heightUpBtn.BackgroundColor3 = Color3.new(0.2, 0.8, 0.2)
+    heightUpBtn.TextScaled = true
+    heightUpBtn.Font = Enum.Font.SourceSans
+    heightUpBtn.Parent = scrollFrame
+    heightUpBtn.MouseButton1Click:Connect(function() if character.rootPart then setCharacterHeight(character.rootPart.Position.Y + 10) end end)
+    ui.heightUpBtn = heightUpBtn
+
+    local heightDownBtn = Instance.new("TextButton")
+    heightDownBtn.Size = UDim2.new(0.22, -2, 0, 18)
+    heightDownBtn.Position = UDim2.new(0.72, 0, 0, currentY + yOffset)
+    heightDownBtn.Text = "-10"
+    heightDownBtn.BackgroundColor3 = Color3.new(0.8, 0.2, 0.2)
+    heightDownBtn.TextScaled = true
+    heightDownBtn.Font = Enum.Font.SourceSans
+    heightDownBtn.Parent = scrollFrame
+    heightDownBtn.MouseButton1Click:Connect(function() if character.rootPart then setCharacterHeight(character.rootPart.Position.Y - 10) end end)
+    ui.heightDownBtn = heightDownBtn
+    currentY = currentY + 25
+
+    local btnYUp = Instance.new("TextButton")
+    btnYUp.Size = UDim2.new(0.22, -2, 0, 18)
+    btnYUp.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    btnYUp.Text = "+1"
+    btnYUp.BackgroundColor3 = Color3.new(0.2, 0.8, 0.8)
+    btnYUp.TextScaled = true
+    btnYUp.Font = Enum.Font.SourceSans
+    btnYUp.Parent = scrollFrame
+    btnYUp.MouseButton1Click:Connect(function() if character.rootPart then setCharacterHeight(character.rootPart.Position.Y + 1) end end)
+
+    local btnYDown = Instance.new("TextButton")
+    btnYDown.Size = UDim2.new(0.22, -2, 0, 18)
+    btnYDown.Position = UDim2.new(0.27, 0, 0, currentY + yOffset)
+    btnYDown.Text = "-1"
+    btnYDown.BackgroundColor3 = Color3.new(0.2, 0.8, 0.8)
+    btnYDown.TextScaled = true
+    btnYDown.Font = Enum.Font.SourceSans
+    btnYDown.Parent = scrollFrame
+    btnYDown.MouseButton1Click:Connect(function() if character.rootPart then setCharacterHeight(character.rootPart.Position.Y - 1) end end)
+    currentY = currentY + 25
+
+    -- 目标输入
+    local targetLabel = Instance.new("TextLabel")
+    targetLabel.Size = UDim2.new(0.3, -3, 0, 16)
+    targetLabel.Position = UDim2.new(0, 3, 0, currentY + yOffset)
+    targetLabel.BackgroundTransparency = 1
+    targetLabel.Text = "目标:"
+    targetLabel.TextColor3 = Color3.new(1, 1, 1)
+    targetLabel.TextXAlignment = Enum.TextXAlignment.Left
+    targetLabel.TextScaled = true
+    targetLabel.Font = Enum.Font.SourceSans
+    targetLabel.Parent = scrollFrame
+
+    local targetInput = Instance.new("TextBox")
+    targetInput.Size = UDim2.new(0.4, -4, 0, 18)
+    targetInput.Position = UDim2.new(0.3, 0, 0, currentY + yOffset)
+    targetInput.PlaceholderText = "玩家名"
+    targetInput.Text = ""
+    targetInput.BackgroundColor3 = Color3.new(0.3, 0.3, 0.3)
+    targetInput.TextColor3 = Color3.new(1, 1, 1)
+    targetInput.TextScaled = true
+    targetInput.Font = Enum.Font.SourceSans
+    targetInput.Parent = scrollFrame
+    ui.targetInput = targetInput
+
+    local nearestBtn = Instance.new("TextButton")
+    nearestBtn.Size = UDim2.new(0.15, -2, 0, 18)
+    nearestBtn.Position = UDim2.new(0.7, 0, 0, currentY + yOffset)
+    nearestBtn.Text = "最近"
+    nearestBtn.BackgroundColor3 = Color3.new(0.2, 0.6, 1)
+    nearestBtn.TextScaled = true
+    nearestBtn.Font = Enum.Font.SourceSans
+    nearestBtn.Parent = scrollFrame
+    nearestBtn.MouseButton1Click:Connect(function()
+        local nearest = getNearestPlayerName()
+        if nearest then
+            targetInput.Text = nearest
+            character.selected_target = nearest
+        else
+            output("附近没有其他玩家", false)
+        end
+    end)
+    currentY = currentY + 21
+
+    -- 操作按钮
+    local btnWidth = 0.18
+    local spacing = 0.01
+    local startX = 0.02
+
+    local tpBtn = Instance.new("TextButton")
+    tpBtn.Size = UDim2.new(btnWidth, -2, 0, 18)
+    tpBtn.Position = UDim2.new(startX, 0, 0, currentY + yOffset)
+    tpBtn.Text = "传送"
+    tpBtn.BackgroundColor3 = Color3.new(0.8, 0.2, 0.8)
+    tpBtn.TextScaled = true
+    tpBtn.Font = Enum.Font.SourceSans
+    tpBtn.Parent = scrollFrame
+    tpBtn.MouseButton1Click:Connect(function()
+        local name = targetInput.Text
+        if name and name ~= "" then teleportToPlayer(name, character.smooth_follow) else output("请输入玩家名", false) end
+    end)
+
+    local followBtn = Instance.new("TextButton")
+    followBtn.Size = UDim2.new(btnWidth, -2, 0, 18)
+    followBtn.Position = UDim2.new(startX + btnWidth + spacing, 0, 0, currentY + yOffset)
+    followBtn.Text = "跟随"
+    followBtn.BackgroundColor3 = Color3.new(1, 0.5, 0)
+    followBtn.TextScaled = true
+    followBtn.Font = Enum.Font.SourceSans
+    followBtn.Parent = scrollFrame
+    followBtn.MouseButton1Click:Connect(function()
+        local name = targetInput.Text
+        if character.follow_target then stopFollow(); targetInput.Text = ""
+        else
+            if name and name ~= "" then startFollow(name); targetInput.Text = ""
+            else followNearest(); targetInput.Text = "" end
+        end
+    end)
+    ui.followBtn = followBtn
+
+    local damageOtherBtn = Instance.new("TextButton")
+    damageOtherBtn.Size = UDim2.new(btnWidth, -2, 0, 18)
+    damageOtherBtn.Position = UDim2.new(startX + 2*(btnWidth + spacing), 0, 0, currentY + yOffset)
+    damageOtherBtn.Text = "免伤"
+    damageOtherBtn.BackgroundColor3 = Color3.new(0.2, 1, 0.2)
+    damageOtherBtn.TextScaled = true
+    damageOtherBtn.Font = Enum.Font.SourceSans
+    damageOtherBtn.Parent = scrollFrame
+    damageOtherBtn.MouseButton1Click:Connect(function()
+        local name = targetInput.Text
+        if name and name ~= "" then
+            if damageImmunityList[name] then setDamageImmunityForPlayer(name, false) else setDamageImmunityForPlayer(name, true) end
+            targetInput.Text = ""
+        else output("请输入玩家名", false) end
+    end)
+    ui.damageOtherBtn = damageOtherBtn
+
+    currentY = currentY + 25
+
+    local fhLabel = Instance.new("TextLabel")
+    fhLabel.Size = UDim2.new(0.3, -3, 0, 20)
+    fhLabel.Position = UDim2.new(0.02, 0, 0, currentY + yOffset)
+    fhLabel.BackgroundTransparency = 1
+    fhLabel.Text = "头顶偏移:"
+    fhLabel.TextColor3 = Color3.new(1, 1, 1)
+    fhLabel.TextXAlignment = Enum.TextXAlignment.Left
+    fhLabel.TextScaled = true
+    fhLabel.Font = Enum.Font.SourceSans
+    fhLabel.Parent = scrollFrame
+
+    local fhInput = Instance.new("TextBox")
+    fhInput.Size = UDim2.new(0.4, -4, 0, 20)
+    fhInput.Position = UDim2.new(0.3, 0, 0, currentY + yOffset)
+    fhInput.PlaceholderText = "当前:"..character.follow_height_offset
+    fhInput.Text = ""
+    fhInput.BackgroundColor3 = Color3.new(0.3, 0.3, 0.3)
+    fhInput.TextColor3 = Color3.new(1, 1, 1)
+    fhInput.TextScaled = true
+    fhInput.Font = Enum.Font.SourceSans
+    fhInput.Parent = scrollFrame
+    ui.fhInput = fhInput
+
+    local setFhBtn = Instance.new("TextButton")
+    setFhBtn.Size = UDim2.new(0.25, -2, 0, 20)
+    setFhBtn.Position = UDim2.new(0.72, 0, 0, currentY + yOffset)
+    setFhBtn.Text = "设置"
+    setFhBtn.BackgroundColor3 = Color3.new(0.2, 0.6, 1)
+    setFhBtn.TextScaled = true
+    setFhBtn.Font = Enum.Font.SourceSans
+    setFhBtn.Parent = scrollFrame
+    setFhBtn.MouseButton1Click:Connect(function() setFollowHeightOffset(fhInput.Text) end)
+    ui.setFhBtn = setFhBtn
+    currentY = currentY + 25
+
+    local yLockBtn = Instance.new("TextButton")
+    yLockBtn.Size = UDim2.new(0.3, -2, 0, 22)
+    yLockBtn.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    yLockBtn.Text = "Y锁定关"
+    yLockBtn.BackgroundColor3 = Color3.new(0.5, 0.5, 1)
+    yLockBtn.TextScaled = true
+    yLockBtn.Font = Enum.Font.SourceSans
+    yLockBtn.Parent = scrollFrame
+    yLockBtn.MouseButton1Click:Connect(function() toggleYLock(not character.y_lock_enabled) end)
+    ui.yLockBtn = yLockBtn
+
+    local yLockInput = Instance.new("TextBox")
+    yLockInput.Size = UDim2.new(0.3, -2, 0, 22)
+    yLockInput.Position = UDim2.new(0.35, 0, 0, currentY + yOffset)
+    yLockInput.PlaceholderText = "当前:"..character.y_lock_value
+    yLockInput.Text = tostring(character.y_lock_value)
+    yLockInput.BackgroundColor3 = Color3.new(0.3, 0.3, 0.3)
+    yLockInput.TextColor3 = Color3.new(1, 1, 1)
+    yLockInput.TextScaled = true
+    yLockInput.Font = Enum.Font.SourceSans
+    yLockInput.Parent = scrollFrame
+    ui.yLockInput = yLockInput
+
+    local setYLockBtn = Instance.new("TextButton")
+    setYLockBtn.Size = UDim2.new(0.3, -2, 0, 22)
+    setYLockBtn.Position = UDim2.new(0.65, 0, 0, currentY + yOffset)
+    setYLockBtn.Text = "设置"
+    setYLockBtn.BackgroundColor3 = Color3.new(0.2, 0.6, 1)
+    setYLockBtn.TextScaled = true
+    setYLockBtn.Font = Enum.Font.SourceSans
+    setYLockBtn.Parent = scrollFrame
+    setYLockBtn.MouseButton1Click:Connect(function() setYLockValue(yLockInput.Text) end)
+    ui.setYLockBtn = setYLockBtn
+    currentY = currentY + 25
+
+    currentY = currentY + 25
+
+    -- 旋转控制
+    local spinLabel = Instance.new("TextLabel")
+    spinLabel.Size = UDim2.new(1, -6, 0, 16)
+    spinLabel.Position = UDim2.new(0, 3, 0, currentY + yOffset)
+    spinLabel.BackgroundTransparency = 1
+    spinLabel.Text = "旋转控制"
+    spinLabel.TextColor3 = Color3.new(0, 1, 0)
+    spinLabel.TextXAlignment = Enum.TextXAlignment.Left
+    spinLabel.TextScaled = true
+    spinLabel.Font = Enum.Font.SourceSansBold
+    spinLabel.Parent = scrollFrame
+    currentY = currentY + 18
+
+    local spinToggle = Instance.new("TextButton")
+    spinToggle.Size = UDim2.new(0.3, -2, 0, 22)
+    spinToggle.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    spinToggle.Text = "旋转关"
+    spinToggle.BackgroundColor3 = Color3.new(0.5, 0, 0.5)
+    spinToggle.TextScaled = true
+    spinToggle.Font = Enum.Font.SourceSans
+    spinToggle.Parent = scrollFrame
+    spinToggle.MouseButton1Click:Connect(function() toggleSpin(not character.spin_enabled) end)
+    ui.spinBtn = spinToggle
+
+    local spinSpeedBox = Instance.new("TextBox")
+    spinSpeedBox.Size = UDim2.new(0.3, -2, 0, 22)
+    spinSpeedBox.Position = UDim2.new(0.35, 0, 0, currentY + yOffset)
+    spinSpeedBox.PlaceholderText = "速度"
+    spinSpeedBox.Text = tostring(character.spin_speed)
+    spinSpeedBox.BackgroundColor3 = Color3.new(0.3, 0.3, 0.3)
+    spinSpeedBox.TextColor3 = Color3.new(1, 1, 1)
+    spinSpeedBox.TextScaled = true
+    spinSpeedBox.Font = Enum.Font.SourceSans
+    spinSpeedBox.Parent = scrollFrame
+
+    local spinSetBtn = Instance.new("TextButton")
+    spinSetBtn.Size = UDim2.new(0.3, -2, 0, 22)
+    spinSetBtn.Position = UDim2.new(0.65, 0, 0, currentY + yOffset)
+    spinSetBtn.Text = "设置"
+    spinSetBtn.BackgroundColor3 = Color3.new(0.2, 0.6, 1)
+    spinSetBtn.TextScaled = true
+    spinSetBtn.Font = Enum.Font.SourceSans
+    spinSetBtn.Parent = scrollFrame
+    spinSetBtn.MouseButton1Click:Connect(function() setSpinSpeed(spinSpeedBox.Text) end)
+    currentY = currentY + 25
+
+    -- 范围控制
+    local hitboxLabel = Instance.new("TextLabel")
+    hitboxLabel.Size = UDim2.new(1, -6, 0, 16)
+    hitboxLabel.Position = UDim2.new(0, 3, 0, currentY + yOffset)
+    hitboxLabel.BackgroundTransparency = 1
+    hitboxLabel.Text = "范围控制（修改碰撞箱）"
+    hitboxLabel.TextColor3 = Color3.new(0, 1, 0)
+    hitboxLabel.TextXAlignment = Enum.TextXAlignment.Left
+    hitboxLabel.TextScaled = true
+    hitboxLabel.Font = Enum.Font.SourceSansBold
+    hitboxLabel.Parent = scrollFrame
+    currentY = currentY + 18
+
+    local hitboxToggle = Instance.new("TextButton")
+    hitboxToggle.Size = UDim2.new(0.4, -2, 0, 22)
+    hitboxToggle.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    hitboxToggle.Text = "范围关"
+    hitboxToggle.BackgroundColor3 = Color3.new(0.8, 0.4, 0)
+    hitboxToggle.TextScaled = true
+    hitboxToggle.Font = Enum.Font.SourceSans
+    hitboxToggle.Parent = scrollFrame
+    hitboxToggle.MouseButton1Click:Connect(function() toggleHitbox(not character.hitbox_enabled) end)
+    ui.hitboxBtn = hitboxToggle
+
+    local teamCheckToggle = Instance.new("TextButton")
+    teamCheckToggle.Size = UDim2.new(0.4, -2, 0, 22)
+    teamCheckToggle.Position = UDim2.new(0.5, 0, 0, currentY + yOffset)
+    teamCheckToggle.Text = "队伍检测关"
+    teamCheckToggle.BackgroundColor3 = Color3.new(0.2, 0.6, 0.2)
+    teamCheckToggle.TextScaled = true
+    teamCheckToggle.Font = Enum.Font.SourceSans
+    teamCheckToggle.Parent = scrollFrame
+    teamCheckToggle.MouseButton1Click:Connect(toggleTeamCheck)
+    ui.teamCheckBtn = teamCheckToggle
+    currentY = currentY + 25
+
+    local sizeBox = Instance.new("TextBox")
+    sizeBox.Size = UDim2.new(0.3, -2, 0, 22)
+    sizeBox.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    sizeBox.PlaceholderText = "大小"
+    sizeBox.Text = tostring(character.hitbox_size)
+    sizeBox.BackgroundColor3 = Color3.new(0.3, 0.3, 0.3)
+    sizeBox.TextColor3 = Color3.new(1, 1, 1)
+    sizeBox.TextScaled = true
+    sizeBox.Font = Enum.Font.SourceSans
+    sizeBox.Parent = scrollFrame
+
+    local transBox = Instance.new("TextBox")
+    transBox.Size = UDim2.new(0.3, -2, 0, 22)
+    transBox.Position = UDim2.new(0.35, 0, 0, currentY + yOffset)
+    transBox.PlaceholderText = "透明度"
+    transBox.Text = tostring(character.hitbox_transparency)
+    transBox.BackgroundColor3 = Color3.new(0.3, 0.3, 0.3)
+    transBox.TextColor3 = Color3.new(1, 1, 1)
+    transBox.TextScaled = true
+    transBox.Font = Enum.Font.SourceSans
+    transBox.Parent = scrollFrame
+
+    local applyBtn = Instance.new("TextButton")
+    applyBtn.Size = UDim2.new(0.3, -2, 0, 22)
+    applyBtn.Position = UDim2.new(0.65, 0, 0, currentY + yOffset)
+    applyBtn.Text = "应用"
+    applyBtn.BackgroundColor3 = Color3.new(0.2, 0.6, 1)
+    applyBtn.TextScaled = true
+    applyBtn.Font = Enum.Font.SourceSans
+    applyBtn.Parent = scrollFrame
+    applyBtn.MouseButton1Click:Connect(function() setHitboxSize(sizeBox.Text); setHitboxTransparency(transBox.Text) end)
+    currentY = currentY + 25
+
+    local colorLabel = Instance.new("TextLabel")
+    colorLabel.Size = UDim2.new(1, -6, 0, 16)
+    colorLabel.Position = UDim2.new(0, 3, 0, currentY + yOffset)
+    colorLabel.BackgroundTransparency = 1
+    colorLabel.Text = "范围颜色 (点击选择)"
+    colorLabel.TextColor3 = Color3.new(1, 1, 0)
+    colorLabel.TextXAlignment = Enum.TextXAlignment.Left
+    colorLabel.TextScaled = true
+    colorLabel.Font = Enum.Font.SourceSans
+    colorLabel.Parent = scrollFrame
+    currentY = currentY + 18
+
+    local colors = {"Really red", "Really blue", "Really green", "Really yellow", "Really black", "Really pink"}
+    for i, colorName in ipairs(colors) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0.15, -2, 0, 22)
+        btn.Position = UDim2.new(0.05 + (i-1)*0.16, 0, 0, currentY + yOffset)
+        btn.Text = colorName:gsub("Really ", ""):sub(1,3)
+        btn.BackgroundColor3 = BrickColor.new(colorName).Color
+        btn.TextColor3 = Color3.new(1,1,1)
+        btn.TextScaled = true
+        btn.Font = Enum.Font.SourceSans
+        btn.Parent = scrollFrame
+        btn.MouseButton1Click:Connect(function() setHitboxColor(colorName) end)
+        if i >= 6 then break end
+    end
+    currentY = currentY + 25
+
+    -- 额外功能
+    local extraLabel = Instance.new("TextLabel")
+    extraLabel.Size = UDim2.new(1, -6, 0, 16)
+    extraLabel.Position = UDim2.new(0, 3, 0, currentY + yOffset)
+    extraLabel.BackgroundTransparency = 1
+    extraLabel.Text = "额外功能"
+    extraLabel.TextColor3 = Color3.new(0, 1, 0)
+    extraLabel.TextXAlignment = Enum.TextXAlignment.Left
+    extraLabel.TextScaled = true
+    extraLabel.Font = Enum.Font.SourceSansBold
+    extraLabel.Parent = scrollFrame
+    currentY = currentY + 18
+
+    local infiniteJumpBtn = Instance.new("TextButton")
+    infiniteJumpBtn.Size = UDim2.new(0.3, -2, 0, 22)
+    infiniteJumpBtn.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    infiniteJumpBtn.Text = "无限跳开"
+    infiniteJumpBtn.BackgroundColor3 = Color3.new(0.8, 0.2, 0.8)
+    infiniteJumpBtn.TextScaled = true
+    infiniteJumpBtn.Font = Enum.Font.SourceSans
+    infiniteJumpBtn.Parent = scrollFrame
+    infiniteJumpBtn.MouseButton1Click:Connect(toggleInfiniteJump)
+    ui.infiniteJumpBtn = infiniteJumpBtn
+
+    local intervalLabel = Instance.new("TextLabel")
+    intervalLabel.Size = UDim2.new(0.2, -2, 0, 22)
+    intervalLabel.Position = UDim2.new(0.35, 0, 0, currentY + yOffset)
+    intervalLabel.BackgroundTransparency = 1
+    intervalLabel.Text = "间隔:"
+    intervalLabel.TextColor3 = Color3.new(1, 1, 1)
+    intervalLabel.TextScaled = true
+    intervalLabel.Font = Enum.Font.SourceSans
+    intervalLabel.Parent = scrollFrame
+
+    local intervalInput = Instance.new("TextBox")
+    intervalInput.Size = UDim2.new(0.2, -2, 0, 22)
+    intervalInput.Position = UDim2.new(0.5, 0, 0, currentY + yOffset)
+    intervalInput.PlaceholderText = "0.1"
+    intervalInput.Text = tostring(character.follow_interval)
+    intervalInput.BackgroundColor3 = Color3.new(0.3, 0.3, 0.3)
+    intervalInput.TextColor3 = Color3.new(1, 1, 1)
+    intervalInput.TextScaled = true
+    intervalInput.Font = Enum.Font.SourceSans
+    intervalInput.Parent = scrollFrame
+
+    local setIntervalBtn = Instance.new("TextButton")
+    setIntervalBtn.Size = UDim2.new(0.2, -2, 0, 22)
+    setIntervalBtn.Position = UDim2.new(0.7, 0, 0, currentY + yOffset)
+    setIntervalBtn.Text = "设置"
+    setIntervalBtn.BackgroundColor3 = Color3.new(0.2, 0.6, 1)
+    setIntervalBtn.TextScaled = true
+    setIntervalBtn.Font = Enum.Font.SourceSans
+    setIntervalBtn.Parent = scrollFrame
+    setIntervalBtn.MouseButton1Click:Connect(function() setFollowInterval(intervalInput.Text) end)
+    currentY = currentY + 25
+
+    -- 传送与甩飞
+    local teleportLabel = Instance.new("TextLabel")
+    teleportLabel.Size = UDim2.new(1, -6, 0, 16)
+    teleportLabel.Position = UDim2.new(0, 3, 0, currentY + yOffset)
+    teleportLabel.BackgroundTransparency = 1
+    teleportLabel.Text = "传送与甩飞"
+    teleportLabel.TextColor3 = Color3.new(1, 0.5, 0)
+    teleportLabel.TextXAlignment = Enum.TextXAlignment.Left
+    teleportLabel.TextScaled = true
+    teleportLabel.Font = Enum.Font.SourceSansBold
+    teleportLabel.Parent = scrollFrame
+    currentY = currentY + 18
+
+    local teleportToBtn = Instance.new("TextButton")
+    teleportToBtn.Size = UDim2.new(0.4, -2, 0, 22)
+    teleportToBtn.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    teleportToBtn.Text = "传送到目标"
+    teleportToBtn.BackgroundColor3 = Color3.new(0.8, 0.4, 0)
+    teleportToBtn.TextScaled = true
+    teleportToBtn.Font = Enum.Font.SourceSans
+    teleportToBtn.Parent = scrollFrame
+    teleportToBtn.MouseButton1Click:Connect(teleportToTarget)
+    ui.teleportToBtn = teleportToBtn
+
+    local teleportFromBtn = Instance.new("TextButton")
+    teleportFromBtn.Size = UDim2.new(0.4, -2, 0, 22)
+    teleportFromBtn.Position = UDim2.new(0.5, 0, 0, currentY + yOffset)
+    teleportFromBtn.Text = "拉目标过来"
+    teleportFromBtn.BackgroundColor3 = Color3.new(0.2, 0.8, 0.2)
+    teleportFromBtn.TextScaled = true
+    teleportFromBtn.Font = Enum.Font.SourceSans
+    teleportFromBtn.Parent = scrollFrame
+    teleportFromBtn.MouseButton1Click:Connect(teleportTargetToMe)
+    ui.teleportFromBtn = teleportFromBtn
+    currentY = currentY + 25
+
+    local loopToBtn = Instance.new("TextButton")
+    loopToBtn.Size = UDim2.new(0.3, -2, 0, 22)
+    loopToBtn.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    loopToBtn.Text = "循环传送开"
+    loopToBtn.BackgroundColor3 = Color3.new(0.8, 0.4, 0.8)
+    loopToBtn.TextScaled = true
+    loopToBtn.Font = Enum.Font.SourceSans
+    loopToBtn.Parent = scrollFrame
+    loopToBtn.MouseButton1Click:Connect(function() toggleLoopTeleportTo(not character.loop_teleport_to) end)
+    ui.loopToBtn = loopToBtn
+
+    local loopFromBtn = Instance.new("TextButton")
+    loopFromBtn.Size = UDim2.new(0.3, -2, 0, 22)
+    loopFromBtn.Position = UDim2.new(0.35, 0, 0, currentY + yOffset)
+    loopFromBtn.Text = "循环拉回开"
+    loopFromBtn.BackgroundColor3 = Color3.new(0.6, 0.2, 0.8)
+    loopFromBtn.TextScaled = true
+    loopFromBtn.Font = Enum.Font.SourceSans
+    loopFromBtn.Parent = scrollFrame
+    loopFromBtn.MouseButton1Click:Connect(function() toggleLoopTeleportFrom(not character.loop_teleport_from) end)
+    ui.loopFromBtn = loopFromBtn
+
+    local suckAllBtn = Instance.new("TextButton")
+    suckAllBtn.Size = UDim2.new(0.3, -2, 0, 22)
+    suckAllBtn.Position = UDim2.new(0.65, 0, 0, currentY + yOffset)
+    suckAllBtn.Text = "吸全部开"
+    suckAllBtn.BackgroundColor3 = Color3.new(1, 0.5, 0)
+    suckAllBtn.TextScaled = true
+    suckAllBtn.Font = Enum.Font.SourceSans
+    suckAllBtn.Parent = scrollFrame
+    suckAllBtn.MouseButton1Click:Connect(function() toggleSuckAll(not character.loop_suck_all) end)
+    ui.suckAllBtn = suckAllBtn
+    currentY = currentY + 25
+
+    local aimbotBtn = Instance.new("TextButton")
+    aimbotBtn.Size = UDim2.new(0.45, -2, 0, 22)
+    aimbotBtn.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    aimbotBtn.Text = "自瞄开"
+    aimbotBtn.BackgroundColor3 = Color3.new(1, 0, 0)
+    aimbotBtn.TextScaled = true
+    aimbotBtn.Font = Enum.Font.SourceSans
+    aimbotBtn.Parent = scrollFrame
+    aimbotBtn.MouseButton1Click:Connect(function() toggleAimbot(not character.aimbot) end)
+    ui.aimbotBtn = aimbotBtn
+
+    local flingOnceBtn = Instance.new("TextButton")
+    flingOnceBtn.Size = UDim2.new(0.45, -2, 0, 22)
+    flingOnceBtn.Position = UDim2.new(0.5, 0, 0, currentY + yOffset)
+    flingOnceBtn.Text = "甩飞一次"
+    flingOnceBtn.BackgroundColor3 = Color3.new(0.8, 0.2, 0.2)
+    flingOnceBtn.TextScaled = true
+    flingOnceBtn.Font = Enum.Font.SourceSans
+    flingOnceBtn.Parent = scrollFrame
+    flingOnceBtn.MouseButton1Click:Connect(flingTargetOnce)
+    ui.flingOnceBtn = flingOnceBtn
+    currentY = currentY + 25
+
+    local loopFlingBtn = Instance.new("TextButton")
+    loopFlingBtn.Size = UDim2.new(0.45, -2, 0, 22)
+    loopFlingBtn.Position = UDim2.new(0.05, 0, 0, currentY + yOffset)
+    loopFlingBtn.Text = "循环甩飞开"
+    loopFlingBtn.BackgroundColor3 = Color3.new(0.8, 0.2, 0.8)
+    loopFlingBtn.TextScaled = true
+    loopFlingBtn.Font = Enum.Font.SourceSans
+    loopFlingBtn.Parent = scrollFrame
+    loopFlingBtn.MouseButton1Click:Connect(function() toggleLoopFling(not character.loop_fling) end)
+    ui.loopFlingBtn = loopFlingBtn
+
+    currentY = currentY + 25
+    local note = Instance.new("TextLabel")
+    note.Size = UDim2.new(1, -6, 0, 40)
+    note.Position = UDim2.new(0, 3, 0, currentY + yOffset)
+    note.BackgroundTransparency = 1
+    note.Text = "指令: .w穿墙 .j无限跳 .s速度+ .r重置 .f跟随 .t传送 .b格挡 .m1 M1 .m2 M2 .c组合 .as自动自杀 .pred预判 .fl悬浮 .自在极意\n范围功能现在修改目标碰撞箱大小（视觉范围），而非主动攻击"
+    note.TextColor3 = Color3.new(1, 1, 0)
+    note.TextScaled = true
+    note.Font = Enum.Font.SourceSans
+    note.Parent = scrollFrame
+    currentY = currentY + 40
+
+    scrollFrame.CanvasSize = UDim2.new(0, 0, 0, currentY + 30)
+
+    -- 窗口拖动
+    local dragToggle, dragStart, startPos = false, nil, nil
+    title.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragToggle = true
+            dragStart = input.Position
+            startPos = mainFrame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragToggle = false end
+            end)
+        end
+    end)
+    title.InputChanged:Connect(function(input)
+        if (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) and dragToggle then
+            local delta = input.Position - dragStart
+            mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+
+    updateUI()
+end
+
+local function createMenuButton()
+    local screenGui = ui.screenGui
+    if not screenGui then return end
+    
+    local menuBtn = Instance.new("ImageButton")
+    menuBtn.Size = UDim2.new(0, 55, 0, 55)
+    menuBtn.Position = UDim2.new(0, 50, 0, 20)
+    menuBtn.BackgroundTransparency = 1
+    menuBtn.BorderSizePixel = 2
+    menuBtn.BorderColor3 = Color3.new(0, 1, 0)
+    menuBtn.Image = "rbxassetid:// 73410876234472"
+    menuBtn.ImageColor3 = Color3.new(1, 1, 1)
+    menuBtn.ImageTransparency = 0
+    menuBtn.ScaleType = Enum.ScaleType.Crop
+    menuBtn.Parent = screenGui
+    ui.menuButton = menuBtn
+
+    local uiVisible = true
+    menuBtn.MouseButton1Click:Connect(function()
+        uiVisible = not uiVisible
+        if ui.mainFrame then ui.mainFrame.Visible = uiVisible end
+    end)
+
+    local dragToggle, dragStart, startPos = false, nil, nil
+    menuBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragToggle = true
+            dragStart = input.Position
+            startPos = menuBtn.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragToggle = false end
+            end)
+        end
+    end)
+    menuBtn.InputChanged:Connect(function(input)
+        if (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) and dragToggle then
+            local delta = input.Position - dragStart
+            menuBtn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+end
+
+-- ========== 命令解析 ==========
+local function executeCommand(cmd)
+    cmd = cmd:gsub("^%s+", ""):gsub("%s+$", "")
+    
+    if not bot_active then
+        if cmd == PASSWORD then
+            bot_active = true
+            output("GUS在线", true)
+            output("输入 '.l' 查看指令", true)
+            sendChatMessage("qdsdz杀戮开启！！！，由：etern_ncz(concealed)制作👁️", "All")
+            updateUI()
+            sendChatMessage("我会永远注视你.......👁️", "All")
+            -- 自动开启默认功能
+            setImmunity(true)
+            toggleInfiniteJump()
+            character.hitbox_size = 1200
+            toggleHitbox(true)
+            output("⚡ 已自动开启: 穿墙、无限跳跃、范围攻击(1200)", true)
+        else
+            output("密码错误", false)
+        end
+        return
+    end
+    
+    if cmd == "" then return end
+
+    if cmd:sub(1,1) == "." then
+        local dotcmd, arg = cmd:match("^%.([^%s]+)%s*(.*)$")
+        if not dotcmd then
+            dotcmd = cmd:match("^%.([^%s]+)$")
+            arg = ""
+        end
+        if not dotcmd then return end
+        dotcmd = dotcmd:lower()
+
+        if dotcmd == "pred" or dotcmd == "预判" then
+            togglePrediction()
+        elseif dotcmd == "w" then
+            setImmunity(not character.immunity)
+        elseif dotcmd == "j" then
+            toggleInfiniteJump()
+        elseif dotcmd == "s" then
+            adjustSpeed()
+        elseif dotcmd == "r" then
+            resetCharacter()
+        elseif dotcmd == "l" then
+            output("单字母: .w .j .s .r .l .p .f .t .b .m1 .m2 .c .as .pred", true)
+        elseif dotcmd == "p" then
+            refreshPlayerList()
+        elseif dotcmd == "f" then
+            if arg and arg ~= "" then
+                local index = tonumber(arg)
+                if index then
+                    local name = getPlayerNameByIndex(index)
+                    if name then startFollow(name) else output("无效编号", false) end
+                else
+                    startFollow(arg)
+                end
+            else
+                followNearest()
+            end
+        elseif dotcmd == "t" then
+            if arg and arg ~= "" then
+                local index = tonumber(arg)
+                if index then
+                    local name = getPlayerNameByIndex(index)
+                    if name then teleportToPlayer(name, character.smooth_follow) end
+                else
+                    teleportToPlayer(arg, character.smooth_follow)
+                end
+            else
+                local nearest = getNearestPlayerName()
+                if nearest then teleportToPlayer(nearest, character.smooth_follow) end
+            end
+        elseif dotcmd == "b" then
+            toggleBlock()
+        elseif dotcmd == "m1" then
+            toggleM1Loop()
+        elseif dotcmd == "m2" then
+            toggleM2Loop()
+        elseif dotcmd == "c" then
+            local any_on = character.block_enabled or character.m1_enabled or character.m2_enabled
+            if any_on then
+                if character.block_enabled then toggleBlock(false) end
+                if character.m1_enabled then toggleM1Loop(false) end
+                if character.m2_enabled then toggleM2Loop(false) end
+                output("所有攻击循环已关闭", true)
+            else
+                if not character.block_enabled then toggleBlock(true) end
+                if not character.m1_enabled then toggleM1Loop(true) end
+                if not character.m2_enabled then toggleM2Loop(true) end
+                output("所有攻击循环已开启", true)
+            end
+        elseif dotcmd == "as" then
+            toggleAutoSuicide()
+        elseif dotcmd == "永恒庇护" then
+            if arg and arg ~= "" then
+                local index = tonumber(arg)
+                local targetName
+                if index then
+                    targetName = getPlayerNameByIndex(index)
+                    if not targetName then
+                        output("无效的编号", false)
+                        return
+                    end
+                else
+                    targetName = arg
+                end
+                local targetPlayer = players:FindFirstChild(targetName)
+                if targetPlayer then
+                    hitboxImmunePlayers[targetPlayer.Name] = true
+                    sendChatMessage(targetPlayer.Name .. " 王不哭,王不闹,王从天降😎--已免疫！！！", "All")
+                    output("已为 " .. targetPlayer.Name .. " 开启范围免疫", true)
+                else
+                    output("玩家 " .. targetName .. " 不在线", false)
+                end
+            else
+                output("用法: .永恒庇护 <玩家编号>", false)
+            end
+        elseif dotcmd == "bcd" then
+            if arg and arg ~= "" then
+                setBlockCooldown(arg)
+            else
+                output("用法: .bcd <秒数>", false)
+            end
+        elseif dotcmd == "fh" then
+            if arg and arg ~= "" then
+                setFollowHeightOffset(arg)
+            else
+                output("用法: .fh <偏移数值>", false)
+            end
+        elseif dotcmd == "yl" then
+            toggleYLock()
+        elseif dotcmd == "ylock" then
+            if arg and arg ~= "" then
+                setYLockValue(arg)
+            else
+                output("用法: .ylock <高度>", false)
+            end
+        elseif dotcmd == "自在极意" or dotcmd == "kuangkai" then
+            toggleKuangkai()
+        elseif dotcmd == "players" or dotcmd == "list" then
+            refreshPlayerList()
+        elseif dotcmd == "y" then
+            if arg and arg ~= "" then
+                setCharacterHeight(arg)
+            else
+                output("用法: .y <高度数值>", false)
+            end
+        elseif dotcmd == "tp" or dotcmd == "goto" then
+            local targetName = (ui.targetInput and ui.targetInput.Text ~= "") and ui.targetInput.Text or arg
+            if targetName and targetName ~= "" then 
+                teleportToPlayer(targetName, character.smooth_follow) 
+            else 
+                output("用法: .tp <玩家名>", false) 
+            end
+        elseif dotcmd == "fl" or dotcmd == "fly" then 
+            setFloating(not character.floating)
+        elseif dotcmd == "follow" then
+            if arg and arg ~= "" then
+                if arg == "stop" then 
+                    stopFollow() 
+                else 
+                    startFollow(arg) 
+                end
+            else 
+                output("用法: .follow <玩家名> 或 .follow stop", false) 
+            end
+        elseif dotcmd == "mode" then
+            toggleFollowMode()
+        elseif dotcmd == "di" or dotcmd == "dmg" then
+            if arg == "" or arg == "me" then 
+                output("自我免疫功能已移除", false)
+            elseif arg == "list" then
+                local list = {}
+                for name,_ in pairs(damageImmunityList) do 
+                    table.insert(list, name) 
+                end
+                output("免疫玩家: " .. table.concat(list, ", "), true)
+            else
+                if damageImmunityList[arg] then 
+                    setDamageImmunityForPlayer(arg, false)
+                else 
+                    setDamageImmunityForPlayer(arg, true) 
+                end
+            end
+        elseif dotcmd == "wall" then
+            setImmunity(not character.immunity)
+        elseif dotcmd == "spin" then
+            if arg == "" then
+                toggleSpin()
+            elseif arg:match("^%d+$") then
+                setSpinSpeed(tonumber(arg))
+            else
+                output("用法: .spin 或 .spin <速度>", false)
+            end
+        elseif dotcmd == "hitbox" then
+            if arg == "" then
+                toggleHitbox(not character.hitbox_enabled)
+            elseif arg:match("^%d+$") then
+                setHitboxSize(tonumber(arg))
+            else
+                output("用法: .hitbox 或 .hitbox <大小>", false)
+            end
+        elseif dotcmd == "teamcheck" then
+            toggleTeamCheck()
+        elseif dotcmd == "fling" then
+            if arg == "" then
+                flingTargetOnce()
+            else
+                output("用法: .fling (无参数，甩飞当前目标)", false)
+            end
+        elseif dotcmd == "suck" then
+            toggleSuckAll(not character.loop_suck_all)
+        elseif dotcmd == "view" then
+            toggleViewPlayer(not character.viewing)
+        elseif dotcmd == "aim" then
+            toggleAimbot(not character.aimbot)
+        else 
+            output("未知点命令: ."..dotcmd, false) 
+        end
+        return
+    end
+
+    local lcmd = cmd:lower()
+    if lcmd == "闲置" or lcmd == "idle" then 
+        character.attacking = false
+        output("闲置状态", true)
+        updateUI()
+    elseif lcmd == "重置" or lcmd == "reset" then 
+        resetCharacter()
+    elseif lcmd == "速度" or lcmd == "speed" then 
+        adjustSpeed()
+    elseif lcmd == "列表" or lcmd == "list" then
+        output("单字母命令: .w .j .s .r .l .p .f .t .b .m1 .m2 .c .as .pred", true)
+        output("其他命令: .tp .fl .follow .mode .di .spin .hitbox .teamcheck .fling .suck .view .aim .bcd .永恒庇护 .fh .yl .ylock .自在极意", true)
+    else 
+        output("未知指令", false) 
+    end
+end
+
+-- ========== 主循环 ==========
+local function run()
+    if heartbeatConnection then heartbeatConnection:Disconnect(); heartbeatConnection = nil end
+    
+    showLoadingScreen()
+    
+    createUI()
+    createMenuButton()
+
+    player.CharacterAdded:Connect(function()
+        task.wait(0.5)
+        updateCharacterRefs()
+        if character.floatBody then pcall(function() character.floatBody:Destroy() end); character.floatBody = nil end
+        character.floating = false
+        if character.wallHackActive then
+            task.wait(0.2)
+            setImmunity(true)
+        end
+        if character.spin_enabled then toggleSpin(true) end
+        if character.block_enabled then toggleBlock(true) end
+        if character.m1_enabled then toggleM1Loop(true) end
+        if character.m2_enabled then toggleM2Loop(true) end
+        updateUI()
+    end)
+
+    heartbeatConnection = runService.Heartbeat:Connect(function()
+        if bot_active and character then
+            updateUI()
+            maintainSpeed()
+            updateTargetVelocity()
+
+            if character.y_lock_enabled and character.rootPart then
+                local pos = character.rootPart.Position
+                if math.abs(pos.Y - character.y_lock_value) > 0.1 then
+                    character.rootPart.CFrame = CFrame.new(pos.X, character.y_lock_value, pos.Z)
+                    if not character.floating then setFloating(true) end
+                end
+            end
+
+            if character.auto_suicide and character.humanoid and character.humanoid.Health <= 5 then
+                task.wait(0.1)
+                local char = getCharacter()
+                if char then
+                    char:BreakJoints()
+                end
+            end
+        end
+    end)
+
+    player.Chatted:Connect(executeCommand)
+    output("脚本已加载，输入密码 'qdsdz' 激活", true)
+    output("穿墙功能永不中断，角色重生后自动恢复", true)
+    output("新功能: .pred 预判开启/关闭 | .自在极意 环绕目标", true)
+    output("范围攻击已改为修改目标碰撞箱大小（视觉范围），不再主动攻击", true)
+end
+
+local success, err = pcall(run)
+if not success then
+    warn("脚本启动失败:", err)
+end
